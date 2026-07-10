@@ -1,120 +1,138 @@
-# AlphaChannel: Institutional Risk Synchronizer & Strategic Governance Agent
+<p align="center">
+  <img src="assets/alpha-channel-banner.svg" alt="AlphaChannel: Institutional risk intelligence for Slack" width="100%" />
+</p>
 
-AlphaChannel is a production-oriented Slack agent for detecting corporate blind spots before they become governance failures. It transforms internal collaboration signals into a secure, stateful interaction layer, then cross-references workspace sentiment against external evidence from SEC EDGAR filing footnotes and live yFinance options-volatility skews.
+<h2 align="center">Catch the risk your deal room cannot see.</h2>
 
-The agent uses Model Context Protocol (MCP) handler boundaries to normalize research inputs, routes them through specialized risk nodes, and synthesizes a concise institutional assessment through a Qwen model exposed by an OpenAI-compatible completions API. Recommendations return to Slack as interactive Block Kit controls. No trade is executed automatically: allocation and hedge actions remain explicit human governance checkpoints.
+<p align="center">
+  <strong>AlphaChannel</strong> turns Slack into a stateful institutional risk console. It contrasts internal conviction with live SEC EDGAR disclosures and Yahoo Finance MCP options-market signals, then routes consequential decisions through human approval.
+</p>
 
-## Why AlphaChannel
+<p align="center">
+  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" />
+  <img alt="Slack Bolt and Socket Mode" src="https://img.shields.io/badge/Slack-Bolt%20%2B%20Socket%20Mode-4A154B?logo=slack&logoColor=white" />
+  <img alt="Qwen" src="https://img.shields.io/badge/AI-Qwen-615CED" />
+  <img alt="Model Context Protocol" src="https://img.shields.io/badge/MCP-FastMCP-159570" />
+  <img alt="SEC EDGAR" src="https://img.shields.io/badge/data-SEC%20EDGAR-B31B1B" />
+  <img alt="Human approval required" src="https://img.shields.io/badge/trades-human%20approval%20required-1F883D" />
+</p>
 
-Internal teams can become bullish, complacent, or anchored to stale assumptions while external risk signals move in the opposite direction. AlphaChannel measures that divergence by combining:
+<p align="center"><em>Built for the Slack Agent Builder Challenge.</em></p>
 
-- Slack Real-time Search context, including relevant messages, files, and surrounding discussion.
-- SEC 10-K and 10-Q risk evidence, including footnoted liabilities and disclosure changes.
-- yFinance option-chain indicators, including implied volatility and market-skew markers.
-- Bull/Bear cross-examination that labels material perception-versus-reality gaps as executive blind spots.
-- Human-approved mitigation checkpoints that never submit autonomous trades.
+<p align="center">
+  <a href="#the-problem">The problem</a> &middot;
+  <a href="#see-it-in-action">See it in action</a> &middot;
+  <a href="#why-it-is-an-agent">Why it is an agent</a> &middot;
+  <a href="#architecture">Architecture</a> &middot;
+  <a href="#quick-start">Quick start</a> &middot;
+  <a href="#security-and-governance">Security</a>
+</p>
 
-## System Architecture
+---
 
-```text
-+---------------------------+
-| User Event                |
-| @AlphaChannel analyze NU  |
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-| Slack Socket Mode         |
-| Bolt events and actions   |
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-| Orchestrator              |
-| engine/core_router.py     |
-+-------------+-------------+
-              |
-              v
-+---------------------------------------------------+
-| Specialized Parallel Sub-Nodes                    |
-|                                                   |
-|  +--------------------+  +----------------------+  |
-|  | SEC Research Node  |  | yFinance Risk Node   |  |
-|  | engine/sec_node.py |  | engine/yfinance_node |  |
-|  +--------------------+  +----------------------+  |
-+-------------------------+-------------------------+
-                          |
-                          v
-+---------------------------------------------------+
-| Token-Optimized Synthesis                         |
-| Qwen via OpenAI-Compatible Completions Layer      |
-+-------------------------+-------------------------+
-                          |
-                          v
-+---------------------------------------------------+
-| Interactive Block Kit Dynamic UI Updates          |
-+-------------------------+-------------------------+
-                          |
-                          v
-+---------------------------------------------------+
-| Non-Blocking Background Thread Execution Callbacks|
-+---------------------------------------------------+
-```
+## The problem
 
-Slack action payloads are acknowledged immediately. Long-running SEC, market-data, and LLM work continues in daemon worker threads that update one Slack message in place, preserving Socket Mode responsiveness.
+Investment and corporate strategy teams make consequential decisions inside fast-moving Slack threads. Confidence compounds quickly, while the evidence that should challenge it is scattered across filing footnotes, options chains, and disconnected research systems.
 
-## Core Features
+That creates an **executive blind spot**: internal consensus can remain bullish while liquidity pressure, litigation exposure, disclosure changes, or volatility skew tells a different story.
 
-### Multi-Threaded Progress UI
+AlphaChannel closes that gap where the decision already happens. It retrieves relevant workspace context, asks an LLM to plan the investigation, executes live research through MCP tools, and returns a concise governance scorecard to Slack.
 
-Deep-audit and allocation-trim actions acknowledge button clicks immediately, start isolated background workers, and stream node-level progress with `chat.update`. Qwen synthesis and Slack API failures are bounded by exception handling and deterministic fallback responses.
+## See it in action
 
-### Live Portfolio Monitoring Dashboard
-
-The Portfolio Center presents institutional positions as Block Kit sections with allocation status and per-asset controls. Users can initiate a deep divergence audit or queue defensive trim logic directly from the dashboard.
-
-### Human-in-the-Loop Governance Guardrails
-
-The Trading Node maps buy, sell, and hedge recommendations into decision checkpoints. Every contract records the ticker, internal consensus, external risk markers, verdict, and target mitigation orders. AlphaChannel generates defensive logic but does not autonomously execute a transaction.
-
-### Natural Language Intent Routing
-
-AlphaChannel accepts flexible Slack phrasing while maintaining deterministic routing:
+Ask an open-ended question in a channel or the Agent View:
 
 ```text
-@AlphaChannel evaluate NU
-@AlphaChannel analyze SNOW
-@AlphaChannel check NOW
-@AlphaChannel risk assessment on NU
-@AlphaChannel status for SNOW
-
-@AlphaChannel portfolio
-@AlphaChannel list all my positions
-@AlphaChannel show holdings
-@AlphaChannel positions
-@AlphaChannel dashboard
+@AlphaChannel Check if ServiceNow is a risky buy right now.
 ```
 
-## Repository Layout
+AlphaChannel then:
+
+1. Retains the request as part of the Slack thread's conversation state.
+2. Lets Qwen select the evidence it needs from registered MCP tool schemas.
+3. Fetches live market structure from yFinance and the latest relevant filing from SEC EDGAR.
+4. Streams each research step into one updating Slack message without blocking Socket Mode.
+5. Cross-examines internal perception against external evidence and validates the result with Pydantic.
+6. Presents any trade or diagnostic action as an Approve, Deny, or Edit checkpoint.
+
+The **Portfolio Center** provides the same interaction model across institutional holdings:
 
 ```text
-alpha-channel/
-|-- app.py                   # Slack Bolt Socket Mode entry point
-|-- manifest.json            # Slack events, interactivity, and OAuth scopes
-|-- requirements.txt         # Runtime dependencies
-|-- .env.example             # Local configuration template
-|-- LICENSE                  # MIT license
-`-- engine/
-    |-- __init__.py
-    |-- core_router.py       # Assessment orchestration and synthesis contract
-    |-- sec_node.py          # SEC filing risk extraction
-    |-- yfinance_node.py     # Options and implied-volatility analysis
-    `-- trading_node.py      # Human decision checkpoints and portfolio state
+@AlphaChannel show my portfolio
+@AlphaChannel deep audit NU
 ```
 
-`app.py` is the canonical application entry point. The Slack application does not require Streamlit or an HTTP request server.
+## Why it is an agent
 
-## Local Setup
+AlphaChannel is not a command-to-script switchboard. The Qwen planning loop is the central dispatcher.
+
+- **Goal-oriented planning:** the model receives the user's goal, thread memory, workspace perception, and available MCP tool schemas.
+- **Autonomous tool choice:** read-only research tools can run without a hardcoded execution graph.
+- **Observation loop:** every tool result returns to the model, which decides whether to gather more evidence or synthesize an answer.
+- **Multi-turn continuity:** conversation and pending actions are keyed to the Slack channel and thread timestamp.
+- **Governed autonomy:** diagnostics and trade checkpoints pause the same reasoning continuation until a user approves, denies, or edits the parameters.
+- **Bounded execution:** the loop has a six-iteration cap, typed contracts, tool policy enforcement, and deterministic failure handling.
+
+## Architecture
+
+```text
+ Open-ended Slack request
+            |
+            v
+ Slack Bolt + Socket Mode ---- Slack Real-Time Search context
+            |
+            v
+ Qwen planning and reasoning loop <-------------------------+
+            |                                                |
+            v                                                |
+ MCP tool selection                                          |
+       +----+-------------------+                            |
+       |                        |                            |
+       v                        v                            |
+ Safe research tools      Consequential tools               |
+ yFinance / SEC EDGAR     Diagnostics / trade gate           |
+       |                  Approve | Deny | Edit               |
+       +------------------------+-----------------------------+
+                                |
+                                v
+ Perception-vs-reality synthesis + Pydantic validation
+                                |
+                                v
+ Slack Block Kit scorecard + non-blocking progress updates
+```
+
+| Layer | Responsibility |
+| --- | --- |
+| [`app.py`](app.py) | Slack events, Agent View, Real-Time Search, Block Kit, and background callbacks |
+| [`engine/agent_brain.py`](engine/agent_brain.py) | Qwen planning, MCP tool-call loop, and typed final synthesis |
+| [`engine/core_router.py`](engine/core_router.py) | Thread memory, action continuations, and orchestration contracts |
+| [`engine/mcp_client.py`](engine/mcp_client.py) | MCP transport, schema exposure, and execution policy enforcement |
+| [`engine/mcp_server.py`](engine/mcp_server.py) | Registered finance, filing, repository, diagnostic, and checkpoint tools |
+| [`engine/sec_node.py`](engine/sec_node.py) | Live SEC EDGAR resolution, filing retrieval, parsing, and risk extraction |
+| [`engine/yfinance_node.py`](engine/yfinance_node.py) | Price, options-chain, implied-volatility, and skew signals |
+| [`engine/trading_node.py`](engine/trading_node.py) | Portfolio state and human-governed mitigation checkpoints |
+
+For deeper implementation notes, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Core capabilities
+
+### Live perception-vs-reality analysis
+
+Slack Real-Time Search provides relevant messages, files, and surrounding context as the **Internal Workspace Perception**. Qwen cross-examines that material against live **External Reality** evidence from SEC filings and market structure, explicitly flagging material divergence.
+
+### Multi-threaded progress UI
+
+Slack interactions are acknowledged immediately. SEC, yFinance, and LLM work runs in background threads while `chat.update` streams compact status changes into a single message. The Socket Mode event loop stays responsive throughout the investigation.
+
+### Portfolio monitoring
+
+The Portfolio Center renders institutional holdings as Block Kit layouts with allocation state, Deep Audit, and Trim controls. A deep audit re-enters the same agentic evidence loop rather than returning a static portfolio message.
+
+### Human-in-the-loop guardrails
+
+AlphaChannel does **not** place autonomous trades. Buy, sell, hedge, test, and diagnostic recommendations become explicit checkpoints with editable parameters and a retained audit trail.
+
+## Quick start
 
 ### 1. Create the environment
 
@@ -125,9 +143,9 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-For macOS or Linux, activate with `source venv/bin/activate` and create the configuration with `cp .env.example .env`.
+On macOS or Linux, use `source venv/bin/activate` and `cp .env.example .env`.
 
-### 2. Configure `.env`
+### 2. Configure credentials
 
 ```dotenv
 SLACK_BOT_TOKEN=xoxb-your-bot-token
@@ -138,60 +156,64 @@ DASHSCOPE_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen3.6-flash
 QWEN_TIMEOUT_SECONDS=30
 
+# SEC requires an identifiable organization and monitored contact address.
+SEC_EDGAR_USER_AGENT=AlphaChannel your-email@example.com
+
 LOG_LEVEL=INFO
 ALPHACHANNEL_RTS_LIMIT=12
 ```
 
-`python-dotenv` loads this file before Slack, engine, or Qwen clients are initialized. Existing process-level environment variables take precedence because `.env` loading uses `override=False`.
+`python-dotenv` loads `.env` before Slack or model clients initialize. Process-level environment variables take precedence. Never commit `.env`, access tokens, API keys, action tokens, or workspace content.
 
-Never commit `.env`, Slack tokens, API keys, action tokens, or workspace message content.
+### 3. Install and run
 
-### 3. Install the Slack manifest
-
-Create or update the app from `manifest.json`, enable Socket Mode, and reinstall it whenever OAuth scopes change. The app requires an `xapp-` Socket Mode token and an `xoxb-` bot token with the manifest's granular Real-time Search scopes.
-
-### 4. Run AlphaChannel
+Create the Slack app from [`manifest.json`](manifest.json), enable Socket Mode, reinstall after any scope change, then start the agent:
 
 ```powershell
 python app.py
 ```
 
-Mention the installed app in an authorized Slack channel:
+Validate the complete live-data path before a demo:
+
+```powershell
+python scripts/golden_path_smoke_test.py
+```
+
+The smoke test succeeds only when Qwen autonomously invokes both `yfinance_risk_lookup` and `sec_risk_lookup`, receives valid MCP observations, and returns a validated synthesis.
+
+## Security and governance
+
+- Slack action tokens remain ephemeral request parameters and are never treated as bearer credentials.
+- Secrets are read from `.env` or the deployment environment and excluded from structured logs.
+- SEC requests use a declared identity, bounded request frequency, and official EDGAR endpoints.
+- Qwen calls use configured regional endpoints, timeouts, typed output validation, and clean fallbacks.
+- MCP policies distinguish autonomous read-only tools from consequential tools that require approval.
+- Trading controls are dry-run governance checkpoints; a separately governed broker integration is required for execution.
+- Thread state is process-local for the hackathon runtime. A multi-instance deployment should use Redis or another shared checkpoint store.
+
+## Repository map
 
 ```text
-@AlphaChannel risk assessment on NU
-@AlphaChannel show holdings
+AlphaChannel/
+|-- app.py
+|-- manifest.json
+|-- mcp_servers.json
+|-- requirements.txt
+|-- .env.example
+|-- scripts/
+|   `-- golden_path_smoke_test.py
+`-- engine/
+    |-- agent_brain.py
+    |-- core_router.py
+    |-- mcp_client.py
+    |-- mcp_server.py
+    |-- sec_node.py
+    |-- yfinance_node.py
+    `-- trading_node.py
 ```
 
-## Operational Safety
+## License
 
-- Slack RTS action tokens are passed as ephemeral request parameters and are never used as bearer credentials.
-- API keys and Slack tokens are read only from the process environment populated by `.env` or the deployment platform.
-- Logs record routing metadata and error classes without printing credentials.
-- Qwen requests use configured regional endpoints, bounded timeouts, and fallback summaries.
-- Interactive trade controls create dry-run checkpoints; execution requires a separately governed broker integration.
+AlphaChannel is released under the [MIT License](LICENSE).
 
-## License and Attribution
-
-AlphaChannel is available under the MIT License. The canonical open-source notice is:
-
-```text
-Copyright (c) 2026 Anand Krishnamoorthy
-SPDX-License-Identifier: MIT
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, subject to the conditions in LICENSE.
-```
-
-Source modules use the following identity header:
-
-```python
-# AlphaChannel: Institutional Risk Synchronizer & Strategic Governance Agent
-# Copyright (c) 2026 Anand Krishnamoorthy
-# SPDX-License-Identifier: MIT
-#
-# Purpose-built for the 2026 Slack Hackathon. See LICENSE for terms.
-```
-
-See [LICENSE](LICENSE) for the complete license text.
+Copyright (c) 2026 Anand Krishnamoorthy.

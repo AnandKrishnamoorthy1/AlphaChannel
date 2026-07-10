@@ -5,6 +5,28 @@
     "background_color": "#0B1F1A"
   },
   "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "agent_view": {
+      "agent_description": "Stateful governance agent with MCP-powered repository diagnostics and human approval checkpoints.",
+      "suggested_prompts": [
+        {
+          "title": "Investigate an error",
+          "message": "Investigate this engineering error using system status and recent git history"
+        },
+        {
+          "title": "Repository status",
+          "message": "Show the current repository system status"
+        },
+        {
+          "title": "Run tests",
+          "message": "Run the unit tests after I approve the MCP action"
+        }
+      ]
+    },
     "bot_user": {
       "display_name": "AlphaChannel",
       "always_online": true
@@ -16,6 +38,7 @@
         "app_mentions:read",
         "chat:write",
         "assistant:write",
+        "im:history",
         "search:read.public",
         "search:read.files",
         "search:read.users"
@@ -25,7 +48,9 @@
   "settings": {
     "event_subscriptions": {
       "bot_events": [
-        "app_mention"
+        "app_mention",
+        "app_home_opened",
+        "message.im"
       ]
     },
     "interactivity": {

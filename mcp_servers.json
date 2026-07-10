@@ -1,0 +1,98 @@
+{
+  "servers": {
+    "alpha_channel_local": {
+      "transport": "stdio",
+      "command": "${PYTHON_EXECUTABLE}",
+      "args": ["engine/mcp_server.py"],
+      "tools": [
+        {
+          "name": "git_history",
+          "description": "Read recent repository commit history.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+              "path": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "system_status",
+          "description": "Read Python, operating-system, branch, and working-tree status.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+          "name": "yfinance_risk_lookup",
+          "description": "Fetch live price, option-chain implied volatility, positioning, and market risk markers for a public-company ticker.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Market ticker, such as NOW or NU"}},
+            "required": ["ticker"],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "sec_risk_lookup",
+          "description": "Fetch the latest live SEC 10-K, 10-Q, 20-F, or 6-K filing and extract governance risk markers; optionally parse supplied filing text.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string"},
+              "filing_text": {"type": "string", "default": ""}
+            },
+            "required": ["ticker"],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "portfolio_holdings",
+          "description": "Read the current institutional portfolio holdings and exposure statuses.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+          "name": "execute_trade_checkpoint",
+          "description": "Create a dry-run buy, sell, or hedge checkpoint. This consequential tool requires explicit Slack approval.",
+          "read_only": false,
+          "requires_approval": true,
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "ticker": {"type": "string"},
+              "side": {"type": "string", "enum": ["buy", "sell", "hedge"]},
+              "notional_usd": {"type": "number", "exclusiveMinimum": 0},
+              "rationale": {"type": "string"}
+            },
+            "required": ["ticker", "side", "notional_usd", "rationale"],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "run_diagnostic",
+          "description": "Run an allowlisted syntax, git-status, or unit-test diagnostic.",
+          "read_only": false,
+          "requires_approval": true,
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "check": {"type": "string", "enum": ["git_status", "python_syntax", "unit_tests"]},
+              "target": {"type": "string", "default": "app.py"}
+            },
+            "required": ["check"],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  }
+}

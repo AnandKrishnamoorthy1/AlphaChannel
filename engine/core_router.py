@@ -6,14 +6,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import threading
 import uuid
-from typing import Any, TypedDict
+from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from engine.agent_brain import BrainRunResult, QwenAgentBrain
 from engine.sec_node import SecRiskExtractor, SecRiskMarker
+from engine.mcp_client import AlphaChannelMCPClient, MCPToolExecution
 from engine.trading_node import TargetMitigationOrder, TradingNode
 from engine.yfinance_node import OptionsRiskMarker, YahooFinanceOptionsWorker
 
@@ -109,6 +115,41 @@ class AssessmentState(TypedDict, total=False):
     target_mitigation_orders: list[TargetMitigationOrder]
 
 
+class AgentTurnRequest(BaseModel):
+    channel_id: str
+    thread_ts: str
+    user_id: str
+    text: str = Field(min_length=1, max_length=12_000)
+    workspace_context: str | None = Field(default=None, max_length=20_000)
+
+
+class ConversationTurn(BaseModel):
+    role: Literal["user", "assistant", "tool"]
+    content: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PendingToolAction(BaseModel):
+    action_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    channel_id: str
+    thread_ts: str
+    requested_by: str
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending", "edited", "executing", "executed", "denied"] = "pending"
+    tool_call_id: str | None = Field(default=None, exclude=True)
+    continuation_messages: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+
+
+class AgentTurnResponse(BaseModel):
+    channel_id: str
+    thread_ts: str
+    message: str
+    tool_executions: list[MCPToolExecution] = Field(default_factory=list)
+    pending_action: PendingToolAction | None = None
+    conversation_turn_count: int
+
+
 class AlphaChannelRouter:
     """Stateful multi-agent orchestrator for Slack-driven governance risk checks."""
 
@@ -146,11 +187,224 @@ class AlphaChannelRouter:
         sec_node: SecRiskExtractor | None = None,
         yfinance_node: YahooFinanceOptionsWorker | None = None,
         trading_node: TradingNode | None = None,
+        mcp_client: AlphaChannelMCPClient | None = None,
+        agent_brain: QwenAgentBrain | None = None,
     ) -> None:
         self.sec_node = sec_node or SecRiskExtractor()
         self.yfinance_node = yfinance_node or YahooFinanceOptionsWorker()
         self.trading_node = trading_node or TradingNode()
+        self.mcp_client = mcp_client or AlphaChannelMCPClient()
+        self.agent_brain = agent_brain or QwenAgentBrain(self.mcp_client)
+        self._conversation_lock = threading.RLock()
+        self._conversations: dict[str, list[ConversationTurn]] = {}
+        self._pending_actions: dict[str, PendingToolAction] = {}
         self._graph = self._build_graph()
+
+    @staticmethod
+    def _conversation_key(channel_id: str, thread_ts: str) -> str:
+        return f"{channel_id}:{thread_ts}"
+
+    def process_agent_turn(
+        self,
+        request: AgentTurnRequest,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> AgentTurnResponse:
+        key = self._conversation_key(request.channel_id, request.thread_ts)
+        with self._conversation_lock:
+            turns = self._conversations.setdefault(key, [])
+            prior_turns = list(turns)
+            turns.append(ConversationTurn(role="user", content=request.text))
+
+        pending_for_thread = self._latest_pending_action(request.channel_id, request.thread_ts)
+        normalized_request = request.text.strip().lower()
+        if pending_for_thread and normalized_request in {"approve", "approve it", "run it", "proceed"}:
+            return self.approve_agent_action(pending_for_thread.action_id, request.user_id)
+        if pending_for_thread and normalized_request in {"deny", "deny it", "cancel", "cancel it"}:
+            return self.deny_agent_action(pending_for_thread.action_id, request.user_id)
+        if pending_for_thread and normalized_request in {"edit", "edit it", "edit parameters", "change parameters"}:
+            message = "Use the Edit Parameters button on the pending MCP checkpoint to submit validated JSON."
+            with self._conversation_lock:
+                turns.append(ConversationTurn(role="assistant", content=message))
+                turn_count = len(turns)
+            return AgentTurnResponse(
+                channel_id=request.channel_id,
+                thread_ts=request.thread_ts,
+                message=message,
+                pending_action=pending_for_thread,
+                conversation_turn_count=turn_count,
+            )
+
+        conversation = [
+            {
+                "role": turn.role if turn.role in {"user", "assistant"} else "assistant",
+                "content": turn.content if turn.role != "tool" else f"Prior MCP observation: {turn.content}",
+            }
+            for turn in prior_turns[-12:]
+        ]
+        brain_result = self.agent_brain.run(
+            goal=request.text,
+            conversation=conversation,
+            workspace_context=request.workspace_context,
+            progress_callback=progress_callback,
+        )
+        executions = brain_result.executions
+        pending_action = self._pending_action_from_brain(request, brain_result)
+        message = brain_result.message
+        with self._conversation_lock:
+            turns = self._conversations[key]
+            for execution in executions:
+                turns.append(ConversationTurn(role="tool", content=f"{execution.tool_name}: {execution.output}"))
+            turns.append(ConversationTurn(role="assistant", content=message))
+            turn_count = len(turns)
+
+        logger.info(
+            "agent_turn_completed",
+            extra={
+                "channel_id": request.channel_id,
+                "thread_ts": request.thread_ts,
+                "tool_count": len(executions),
+                "pending_action_id": pending_action.action_id if pending_action else None,
+                "conversation_turn_count": turn_count,
+            },
+        )
+        return AgentTurnResponse(
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            message=message,
+            tool_executions=executions,
+            pending_action=pending_action,
+            conversation_turn_count=turn_count,
+        )
+
+    def approve_agent_action(self, action_id: str, decided_by: str) -> AgentTurnResponse:
+        with self._conversation_lock:
+            pending = self._require_pending_action(action_id)
+            pending.status = "executing"
+
+        try:
+            execution = self.mcp_client.call_tool(pending.tool_name, pending.arguments)
+        except Exception:
+            with self._conversation_lock:
+                pending.status = "pending"
+            raise
+
+        if not pending.tool_call_id or not pending.continuation_messages:
+            raise RuntimeError("Pending MCP action does not contain a resumable Qwen continuation.")
+        try:
+            brain_result = self.agent_brain.resume(
+                continuation_messages=pending.continuation_messages,
+                tool_call_id=pending.tool_call_id,
+                execution=execution,
+            )
+        except Exception:
+            with self._conversation_lock:
+                pending.status = "pending"
+            raise
+        follow_up_pending = self._pending_action_from_brain(
+            AgentTurnRequest(
+                channel_id=pending.channel_id,
+                thread_ts=pending.thread_ts,
+                user_id=pending.requested_by,
+                text=f"Resume approved action {pending.tool_name}",
+            ),
+            brain_result,
+        )
+
+        with self._conversation_lock:
+            pending.status = "executed"
+            key = self._conversation_key(pending.channel_id, pending.thread_ts)
+            turns = self._conversations.setdefault(key, [])
+            turns.append(ConversationTurn(role="tool", content=f"{execution.tool_name}: {execution.output}"))
+            message = f"Approved by <@{decided_by}>.\n\n{brain_result.message}"
+            turns.append(ConversationTurn(role="assistant", content=message))
+            turn_count = len(turns)
+
+        return AgentTurnResponse(
+            channel_id=pending.channel_id,
+            thread_ts=pending.thread_ts,
+            message=message,
+            tool_executions=brain_result.executions,
+            pending_action=follow_up_pending,
+            conversation_turn_count=turn_count,
+        )
+
+    def deny_agent_action(self, action_id: str, decided_by: str) -> AgentTurnResponse:
+        with self._conversation_lock:
+            pending = self._require_pending_action(action_id)
+            pending.status = "denied"
+            key = self._conversation_key(pending.channel_id, pending.thread_ts)
+            turns = self._conversations.setdefault(key, [])
+            message = f"Denied by <@{decided_by}>. `{pending.tool_name}` was not executed."
+            turns.append(ConversationTurn(role="assistant", content=message))
+            turn_count = len(turns)
+        return AgentTurnResponse(
+            channel_id=pending.channel_id,
+            thread_ts=pending.thread_ts,
+            message=message,
+            conversation_turn_count=turn_count,
+        )
+
+    def edit_agent_action(self, action_id: str, arguments: dict[str, Any], edited_by: str) -> PendingToolAction:
+        with self._conversation_lock:
+            pending = self._require_pending_action(action_id)
+            pending.arguments = arguments
+            pending.status = "edited"
+            if pending.tool_call_id:
+                for message in pending.continuation_messages:
+                    for tool_call in message.get("tool_calls", []):
+                        if tool_call.get("id") == pending.tool_call_id:
+                            tool_call["function"]["arguments"] = json.dumps(arguments)
+            key = self._conversation_key(pending.channel_id, pending.thread_ts)
+            self._conversations.setdefault(key, []).append(
+                ConversationTurn(
+                    role="assistant",
+                    content=f"<@{edited_by}> edited `{pending.tool_name}` parameters: {arguments}",
+                )
+            )
+            return pending.model_copy(deep=True)
+
+    def get_pending_agent_action(self, action_id: str) -> PendingToolAction:
+        with self._conversation_lock:
+            return self._require_pending_action(action_id).model_copy(deep=True)
+
+    def _require_pending_action(self, action_id: str) -> PendingToolAction:
+        action = self._pending_actions.get(action_id)
+        if action is None:
+            raise ValueError("Agent action was not found or has expired.")
+        if action.status not in {"pending", "edited"}:
+            raise ValueError(f"Agent action is already {action.status}.")
+        return action
+
+    def _latest_pending_action(self, channel_id: str, thread_ts: str) -> PendingToolAction | None:
+        with self._conversation_lock:
+            for action in reversed(list(self._pending_actions.values())):
+                if (
+                    action.channel_id == channel_id
+                    and action.thread_ts == thread_ts
+                    and action.status in {"pending", "edited"}
+                ):
+                    return action.model_copy(deep=True)
+        return None
+
+    def _pending_action_from_brain(
+        self,
+        request: AgentTurnRequest,
+        result: BrainRunResult,
+    ) -> PendingToolAction | None:
+        if not result.pending_tool_name:
+            return None
+        pending = PendingToolAction(
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            requested_by=request.user_id,
+            tool_name=result.pending_tool_name,
+            arguments=result.pending_arguments,
+            tool_call_id=result.pending_tool_call_id,
+            continuation_messages=result.continuation_messages,
+        )
+        with self._conversation_lock:
+            self._pending_actions[pending.action_id] = pending
+        return pending
 
     def run_assessment(self, request: RiskAssessmentRequest) -> RiskAssessmentResponse:
         logger.info(

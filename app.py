@@ -6,9 +6,9 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -26,9 +26,11 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from engine.core_router import (
+    AgentTurnRequest,
+    AgentTurnResponse,
     AlphaChannelRouter,
     InternalWorkspacePerception,
-    RiskAssessmentRequest,
+    PendingToolAction,
     WorkspaceAttachment,
     WorkspaceMessage,
 )
@@ -44,23 +46,12 @@ if DOTENV_LOAD_ERROR:
     logger.warning("dotenv_load_failed", extra={"env_file": str(ENV_FILE), "error": DOTENV_LOAD_ERROR})
 elif not DOTENV_LOADED:
     logger.info("dotenv_file_not_found", extra={"env_file": str(ENV_FILE)})
+if not (os.getenv("SEC_EDGAR_USER_AGENT") or os.getenv("EDGAR_IDENTITY")):
+    logger.warning("sec_edgar_identity_missing live_sec_tool_will_fail_until_configured=true")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_app = App(token=SLACK_BOT_TOKEN)
 router = AlphaChannelRouter()
-
-CommandIntent = Literal["evaluation", "portfolio", "unknown"]
-PORTFOLIO_INTENT_PATTERN = re.compile(
-    r"\b(?:portfolio|list\s+all\s+my\s+positions|show\s+(?:my\s+)?holdings|positions|dashboard)\b",
-    flags=re.IGNORECASE,
-)
-EVALUATION_INTENT_PATTERN = re.compile(
-    r"\b(?:evaluate|analy[sz]e|check|risk\s+assessment|status)\b"
-    r"(?:\s+(?:on|for|of|about|ticker|symbol))?\s+"
-    r"\$?([A-Z][A-Z0-9.\-]{0,9})\b",
-    flags=re.IGNORECASE,
-)
-
 
 def _extract_action_token(body: dict[str, Any], context: dict[str, Any] | None = None) -> str | None:
     """Slack assistant surfaces can place action tokens in different envelopes."""
@@ -85,15 +76,43 @@ def _strip_bot_mention(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text or "").strip()
 
 
-def _match_command_intent(text: str) -> tuple[CommandIntent, str | None]:
-    if PORTFOLIO_INTENT_PATTERN.search(text):
-        return "portfolio", None
+def _format_slack_mrkdwn(text: str, *, stream_output: bool = False) -> str:
+    """Normalize generated Markdown to Slack mrkdwn and fence diagnostic output."""
+    normalized = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"*\1*", str(text), flags=re.DOTALL)
+    stripped = normalized.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        return stripped
 
-    evaluation_match = EVALUATION_INTENT_PATTERN.search(text)
-    if evaluation_match:
-        return "evaluation", evaluation_match.group(1).upper()
+    is_stack_trace = bool(
+        re.search(
+            r"(?:^|\n)(?:Traceback \(most recent call last\):|Stack trace:|[A-Za-z]+Error:\s)",
+            stripped,
+        )
+    )
+    is_large_stream = stream_output and (len(stripped) >= 1500 or stripped.count("\n") >= 20)
+    if is_stack_trace or is_large_stream:
+        safe_code = stripped.replace("```", "'''")
+        return f"```\n{safe_code}\n```"
 
-    return "unknown", None
+    return normalized
+
+
+def _normalize_slack_blocks(blocks: list[dict[str, Any]], *, stream_output: bool = False) -> list[dict[str, Any]]:
+    def normalize_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [normalize_value(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        normalized = {key: normalize_value(item) for key, item in value.items()}
+        if normalized.get("type") == "mrkdwn" and isinstance(normalized.get("text"), str):
+            normalized["text"] = _format_slack_mrkdwn(
+                normalized["text"],
+                stream_output=stream_output,
+            )
+        return normalized
+
+    return [normalize_value(block) for block in blocks]
 
 
 def _normalize_search_response(
@@ -247,11 +266,18 @@ def retrieve_internal_workspace_perception(
             },
         )
         response = client.api_call("assistant.search.context", json=payload)
-        if not response.get("ok", False):
+        raw_response_data = getattr(response, "data", response)
+        if not isinstance(raw_response_data, Mapping):
+            raise TypeError(
+                "assistant.search.context returned an unsupported payload type: "
+                f"{type(raw_response_data).__name__}"
+            )
+        response_data = dict(raw_response_data)
+        if not response_data.get("ok", False):
             raise SlackApiError(message="assistant.search.context returned ok=false", response=response)
         return _normalize_search_response(
             query=query,
-            response=dict(response),
+            response=response_data,
             channel_id=channel_id,
             user_id=user_id,
         )
@@ -277,69 +303,36 @@ def retrieve_internal_workspace_perception(
             errors=[slack_error],
             raw_result_count=1,
         )
-
-
-def _build_assessment_blocks(response_contract: dict[str, Any]) -> list[dict[str, Any]]:
-    ticker = response_contract["Ticker"]
-    verdict = response_contract["Verdict"]
-    internal = response_contract["Internal Consensus %"]
-    markers = response_contract["External Risk Markers"]
-    orders = response_contract["Target Mitigation Orders"]
-
-    marker_text = "\n".join(f"🔴 {marker}" for marker in markers[:8]) or "🟢 No severe external markers detected."
-    order_text = "\n".join(
-        f"• *{order['order_type']}*: {order['rationale']}" for order in orders[:4]
-    ) or "• Hold for executive review."
-
-    button_value = json.dumps(
-        {
-            "assessment_id": response_contract["assessment_id"],
-            "ticker": ticker,
-            "verdict": verdict,
-        }
-    )
-
-    return [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"AlphaChannel Risk Alignment: {ticker}", "emoji": True},
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Verdict*\n{verdict}"}},
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*🟢 Internal Deal-Room Perception*\nConsensus: *{internal}*"},
-                {"type": "mrkdwn", "text": f"*🔴 External Market & SEC Reality*\n{marker_text}"},
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "slack_rts_response_invalid",
+            extra={
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "fallback_source": "slack_assistant_search_context_invalid_response",
+            },
+        )
+        return InternalWorkspacePerception(
+            query=query,
+            source="slack_assistant_search_context_invalid_response",
+            channel_id=channel_id,
+            requested_by=user_id,
+            context_messages=[
+                WorkspaceMessage(channel_id=channel_id, user_id=user_id, text=query, ts=thread_ts or "")
             ],
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Target Mitigation Orders*\n{order_text}"}},
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "action_id": "approve_buy_allocation",
-                    "text": {"type": "plain_text", "text": "🟢 Approve Buy Allocation", "emoji": True},
-                    "style": "primary",
-                    "value": button_value,
-                },
-                {
-                    "type": "button",
-                    "action_id": "execute_protective_hedge",
-                    "text": {"type": "plain_text", "text": "🔴 Execute Protective Hedge", "emoji": True},
-                    "style": "danger",
-                    "value": button_value,
-                },
-            ],
-        },
-    ]
+            errors=[str(exc)],
+            raw_result_count=1,
+        )
 
 
 def _build_error_blocks(message: str) -> list[dict[str, Any]]:
-    return [
+    formatted_message = _format_slack_mrkdwn(message, stream_output=True)
+    return _normalize_slack_blocks([
         {"type": "header", "text": {"type": "plain_text", "text": "AlphaChannel Request Failed"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Issue*\n{message}"}},
-    ]
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Issue*\n{formatted_message}"}},
+    ])
 
 
 def _build_command_help_blocks() -> list[dict[str, Any]]:
@@ -360,8 +353,198 @@ def _build_command_help_blocks() -> list[dict[str, Any]]:
     ]
 
 
-@slack_app.event("app_mention")
-def handle_app_mention(
+def _slack_code_block(text: str, limit: int = 2500) -> str:
+    safe_text = str(text).replace("```", "'''")
+    if len(safe_text) > limit:
+        safe_text = f"{safe_text[:limit]}\n... output truncated"
+    return f"```\n{safe_text}\n```"
+
+
+def _build_pending_agent_action_blocks(
+    pending: PendingToolAction,
+    message: str,
+) -> list[dict[str, Any]]:
+    return _normalize_slack_blocks(
+        [
+            {"type": "header", "text": {"type": "plain_text", "text": "MCP Action Checkpoint"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": message}},
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Tool*\n`{pending.tool_name}`"},
+                    {"type": "mrkdwn", "text": f"*Status*\n{pending.status}"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Parameters*\n{_slack_code_block(json.dumps(pending.arguments, indent=2))}"},
+            },
+            {
+                "type": "actions",
+                "block_id": f"agent_action_{pending.action_id}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "agent_action_approve",
+                        "text": {"type": "plain_text", "text": "Approve"},
+                        "style": "primary",
+                        "value": pending.action_id,
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "agent_action_deny",
+                        "text": {"type": "plain_text", "text": "Deny"},
+                        "style": "danger",
+                        "value": pending.action_id,
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "agent_action_edit",
+                        "text": {"type": "plain_text", "text": "Edit Parameters"},
+                        "value": pending.action_id,
+                    },
+                ],
+            },
+        ]
+    )
+
+
+def _build_agent_turn_blocks(response: AgentTurnResponse) -> list[dict[str, Any]]:
+    if response.pending_action:
+        return _build_pending_agent_action_blocks(response.pending_action, response.message)
+
+    finance_tools = {"yfinance_risk_lookup", "sec_risk_lookup", "portfolio_holdings"}
+    header = (
+        "AlphaChannel Risk Synthesis"
+        if any(execution.tool_name in finance_tools for execution in response.tool_executions)
+        else "AlphaChannel MCP Investigation"
+    )
+    blocks: list[dict[str, Any]] = [
+        {"type": "header", "text": {"type": "plain_text", "text": header}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": response.message}},
+    ]
+    for execution in response.tool_executions:
+        status = "failed" if execution.is_error else "completed"
+        evidence_text = _summarize_mcp_execution(execution)
+        blocks.extend(
+            [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Tool:* `{execution.tool_name}` | *Status:* {status}\n{evidence_text}",
+                    },
+                },
+                {"type": "divider"},
+            ]
+        )
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Thread memory: {response.conversation_turn_count} turns"}],
+        }
+    )
+    return _normalize_slack_blocks(blocks)
+
+
+def _summarize_mcp_execution(execution: Any) -> str:
+    if execution.is_error:
+        return _slack_code_block(execution.output)
+    try:
+        payload = json.loads(execution.output)
+    except (json.JSONDecodeError, TypeError):
+        return execution.output[:1200]
+    if not isinstance(payload, dict):
+        return str(payload)[:1200]
+
+    if execution.tool_name == "yfinance_risk_lookup":
+        price = payload.get("current_price")
+        iv = payload.get("front_month_iv")
+        put_call = payload.get("put_call_open_interest_ratio")
+        source = payload.get("source_url")
+        return (
+            f"Price: `{price if price is not None else 'n/a'}`  |  "
+            f"Front-month IV: `{f'{iv:.1%}' if isinstance(iv, (int, float)) else 'n/a'}`  |  "
+            f"Put/call OI: `{f'{put_call:.2f}' if isinstance(put_call, (int, float)) else 'n/a'}`"
+            + (f"\n<{source}|Open Yahoo Finance options source>" if source else "")
+        )
+    if execution.tool_name == "sec_risk_lookup":
+        markers = payload.get("risk_markers") or []
+        source = payload.get("filing_url")
+        return (
+            f"Latest filing: `{payload.get('form', 'n/a')}` dated `{payload.get('filing_date', 'n/a')}`  |  "
+            f"Risk markers: `{len(markers)}`"
+            + (f"\n<{source}|Open SEC EDGAR filing>" if source else "")
+        )
+    if execution.tool_name == "portfolio_holdings":
+        return f"Holdings returned: `{len(payload.get('holdings') or [])}`"
+    return _slack_code_block(json.dumps(payload, indent=2))
+
+
+def _start_agent_turn_worker(
+    *,
+    client: WebClient,
+    channel_id: str,
+    thread_ts: str,
+    user_id: str,
+    query: str,
+    workspace_context: str | None,
+) -> None:
+    initial = "⚙️ _Agent Orchestrator:_ Planning MCP tools and checking approval policy..."
+    posted = client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        blocks=_mrkdwn_stream_blocks(initial),
+        text="AlphaChannel is planning MCP tools",
+    )
+    message_ts = posted.get("ts")
+    if not isinstance(message_ts, str) or not message_ts:
+        raise ValueError("Slack did not return a timestamp for the MCP planning message.")
+
+    def worker() -> None:
+        try:
+            def update_progress(status: str) -> None:
+                formatted = f"⚙️ _Agent Brain:_ {status}"
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    blocks=_mrkdwn_stream_blocks(formatted),
+                    text=status,
+                )
+
+            response = router.process_agent_turn(
+                AgentTurnRequest(
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    user_id=user_id,
+                    text=query,
+                    workspace_context=workspace_context,
+                ),
+                progress_callback=update_progress,
+            )
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_build_agent_turn_blocks(response),
+                text=_format_slack_mrkdwn(response.message),
+            )
+        except Exception as exc:
+            logger.exception("agent_turn_worker_failed", extra={"channel_id": channel_id, "thread_ts": thread_ts})
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_build_error_blocks(str(exc)),
+                text="AlphaChannel MCP investigation failed",
+            )
+
+    threading.Thread(
+        target=worker,
+        name=f"alpha-channel-agent-{channel_id}-{thread_ts}",
+        daemon=True,
+    ).start()
+
+
+def _process_slack_message(
     event: dict[str, Any],
     body: dict[str, Any],
     client: WebClient,
@@ -373,27 +556,14 @@ def handle_app_mention(
     query = _strip_bot_mention(event.get("text", ""))
 
     try:
-        intent, ticker = _match_command_intent(query)
         logger.info(
-            "slack_command_intent_matched",
-            extra={"channel_id": channel_id, "user_id": user_id, "intent": intent, "ticker": ticker},
+            "slack_agent_goal_received channel_id=%s user_id=%s goal_chars=%d",
+            channel_id,
+            user_id,
+            len(query),
         )
 
-        if intent == "portfolio":
-            blocks = router.generate_portfolio_dashboard()
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                blocks=blocks,
-                text="AlphaChannel Portfolio Center",
-            )
-            logger.info(
-                "portfolio_dashboard_posted",
-                extra={"channel_id": channel_id, "user_id": user_id, "holding_blocks": len(blocks)},
-            )
-            return
-
-        if intent != "evaluation" or ticker is None:
+        if not query:
             client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
@@ -411,31 +581,13 @@ def handle_app_mention(
             user_id=user_id,
             thread_ts=thread_ts,
         )
-        assessment = router.run_assessment(
-            RiskAssessmentRequest(
-                ticker=ticker,
-                query=query,
-                requested_by=user_id,
-                channel_id=channel_id,
-                internal_workspace_perception=perception,
-            )
-        )
-        response_contract = assessment.to_standard_dict()
-        client.chat_postMessage(
-            channel=channel_id,
+        _start_agent_turn_worker(
+            client=client,
+            channel_id=channel_id,
             thread_ts=thread_ts,
-            blocks=_build_assessment_blocks(response_contract),
-            text=f"AlphaChannel risk alignment assessment for {ticker}",
-        )
-        logger.info(
-            "risk_assessment_posted",
-            extra={
-                "assessment_id": assessment.assessment_id,
-                "ticker": ticker,
-                "channel_id": channel_id,
-                "user_id": user_id,
-                "verdict": assessment.verdict,
-            },
+            user_id=user_id,
+            query=query,
+            workspace_context=perception.text_corpus(),
         )
     except Exception as exc:
         logger.exception("app_mention_failed", extra={"channel_id": channel_id, "user_id": user_id})
@@ -444,6 +596,37 @@ def handle_app_mention(
             thread_ts=thread_ts,
             blocks=_build_error_blocks(str(exc)),
             text="AlphaChannel request failed",
+        )
+
+
+@slack_app.event("app_mention")
+def handle_app_mention(
+    event: dict[str, Any],
+    body: dict[str, Any],
+    client: WebClient,
+    context: dict[str, Any],
+) -> None:
+    _process_slack_message(event, body, client, context)
+
+
+@slack_app.event("message")
+def handle_agent_direct_message(
+    event: dict[str, Any],
+    body: dict[str, Any],
+    client: WebClient,
+    context: dict[str, Any],
+) -> None:
+    if event.get("channel_type") != "im" or event.get("bot_id") or event.get("subtype"):
+        return
+    _process_slack_message(event, body, client, context)
+
+
+@slack_app.event("app_home_opened")
+def handle_agent_view_opened(event: dict[str, Any]) -> None:
+    if event.get("tab") == "messages":
+        logger.info(
+            "agent_view_opened",
+            extra={"channel_id": event.get("channel"), "user_id": event.get("user")},
         )
 
 
@@ -490,12 +673,22 @@ def _action_thread_ts(body: dict[str, Any]) -> str | None:
     return message.get("thread_ts") or message.get("ts") or (body.get("container") or {}).get("message_ts")
 
 
-def _mrkdwn_section_blocks(text: str) -> list[dict[str, Any]]:
-    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+def _action_message_ts(body: dict[str, Any]) -> str:
+    message_ts = (body.get("container") or {}).get("message_ts") or (body.get("message") or {}).get("ts")
+    if not isinstance(message_ts, str) or not message_ts:
+        raise ValueError("Slack action payload did not include a message timestamp.")
+    return message_ts
+
+
+def _mrkdwn_stream_blocks(text: str) -> list[dict[str, Any]]:
+    formatted = _format_slack_mrkdwn(text, stream_output=True)
+    if formatted.startswith("```"):
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": formatted}}]
+    return [{"type": "context", "elements": [{"type": "mrkdwn", "text": formatted}]}]
 
 
 def _portfolio_audit_result_blocks(ticker: str, analysis_text: str) -> list[dict[str, Any]]:
-    return [
+    return _normalize_slack_blocks([
         {
             "type": "header",
             "text": {"type": "plain_text", "text": f"Audit Complete: {ticker}", "emoji": True},
@@ -519,7 +712,7 @@ def _portfolio_audit_result_blocks(ticker: str, analysis_text: str) -> list[dict
                 }
             ],
         },
-    ]
+    ])
 
 
 def _fallback_qwen_audit_paragraph(ticker: str) -> str:
@@ -539,7 +732,8 @@ def _generate_qwen_audit_paragraph(ticker: str) -> str:
     system_prompt = (
         "You are the Lead Risk Analyst for AlphaChannel. Write a concise, ultra-professional institutional "
         "governance paragraph summarizing the deep audit results for the given ticker. Be highly specific to the "
-        "company's real-world business model. Do not use generic filler text."
+        "company's real-world business model. Do not use generic filler text. Use Slack mrkdwn formatting: "
+        "single asterisks for bold text, never double asterisks."
     )
     user_prompt = (
         f"Ticker: {ticker}\n"
@@ -627,13 +821,13 @@ def _generate_qwen_audit_paragraph(ticker: str) -> str:
 
 
 def _build_qwen_audit_result(ticker: str) -> tuple[str, list[dict[str, Any]]]:
-    analysis_text = _generate_qwen_audit_paragraph(ticker)
+    analysis_text = _format_slack_mrkdwn(_generate_qwen_audit_paragraph(ticker))
     final_message = f"✅ *Audit Complete for {ticker}* \n\n{analysis_text}"
     return final_message, _portfolio_audit_result_blocks(ticker, analysis_text)
 
 
 def _portfolio_trim_result_blocks(ticker: str) -> list[dict[str, Any]]:
-    return [
+    return _normalize_slack_blocks([
         {
             "type": "header",
             "text": {"type": "plain_text", "text": f"Trim Framework Queued: {ticker}", "emoji": True},
@@ -654,7 +848,7 @@ def _portfolio_trim_result_blocks(ticker: str) -> list[dict[str, Any]]:
                 }
             ],
         },
-    ]
+    ])
 
 
 def _start_portfolio_progress_worker(
@@ -674,11 +868,12 @@ def _start_portfolio_progress_worker(
         try:
             for step_index, step_text in enumerate(progress_steps, start=1):
                 time.sleep(delay_seconds)
+                formatted_step = _format_slack_mrkdwn(step_text, stream_output=True)
                 client.chat_update(
                     channel=channel_id,
                     ts=message_ts,
-                    blocks=_mrkdwn_section_blocks(step_text),
-                    text=step_text,
+                    blocks=_mrkdwn_stream_blocks(formatted_step),
+                    text=formatted_step,
                 )
                 logger.info(
                     "portfolio_progress_step_updated",
@@ -702,8 +897,8 @@ def _start_portfolio_progress_worker(
             client.chat_update(
                 channel=channel_id,
                 ts=message_ts,
-                blocks=resolved_blocks,
-                text=resolved_message,
+                blocks=_normalize_slack_blocks(resolved_blocks),
+                text=_format_slack_mrkdwn(resolved_message),
             )
             logger.info(
                 "portfolio_progress_completed",
@@ -745,7 +940,10 @@ def approve_buy_allocation(ack: Any, body: dict[str, Any], client: WebClient) ->
         channel=_action_channel_id(body),
         thread_ts=_action_thread_ts(body),
         blocks=[
-            {"type": "section", "text": {"type": "mrkdwn", "text": checkpoint["operator_message"]}},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": _format_slack_mrkdwn(checkpoint["operator_message"])},
+            },
         ],
         text="AlphaChannel checkpoint recorded",
     )
@@ -764,9 +962,142 @@ def execute_protective_hedge(ack: Any, body: dict[str, Any], client: WebClient) 
         channel=_action_channel_id(body),
         thread_ts=_action_thread_ts(body),
         blocks=[
-            {"type": "section", "text": {"type": "mrkdwn", "text": checkpoint["operator_message"]}},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": _format_slack_mrkdwn(checkpoint["operator_message"])},
+            },
         ],
         text="AlphaChannel checkpoint recorded",
+    )
+
+
+@slack_app.action("agent_action_approve")
+def approve_agent_action(ack: Any, body: dict[str, Any], client: WebClient) -> None:
+    ack()
+    action_id = _raw_action_value(body)
+    pending = router.get_pending_agent_action(action_id)
+    channel_id = _action_channel_id(body)
+    message_ts = _action_message_ts(body)
+    executing_message = f"Executing `{pending.tool_name}` through MCP after human approval..."
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        blocks=_mrkdwn_stream_blocks(f"⚙️ _MCP Executor:_ {executing_message}"),
+        text=executing_message,
+    )
+
+    def worker() -> None:
+        try:
+            response = router.approve_agent_action(
+                action_id,
+                body.get("user", {}).get("id", "unknown"),
+            )
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_build_agent_turn_blocks(response),
+                text=response.message,
+            )
+        except Exception as exc:
+            logger.exception("agent_action_approval_failed", extra={"action_id": action_id})
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_build_error_blocks(str(exc)),
+                text="MCP action approval failed",
+            )
+
+    threading.Thread(
+        target=worker,
+        name=f"alpha-channel-mcp-approval-{action_id}",
+        daemon=True,
+    ).start()
+
+
+@slack_app.action("agent_action_deny")
+def deny_agent_action(ack: Any, body: dict[str, Any], client: WebClient) -> None:
+    ack()
+    action_id = _raw_action_value(body)
+    response = router.deny_agent_action(
+        action_id,
+        body.get("user", {}).get("id", "unknown"),
+    )
+    client.chat_update(
+        channel=_action_channel_id(body),
+        ts=_action_message_ts(body),
+        blocks=_build_agent_turn_blocks(response),
+        text=response.message,
+    )
+
+
+@slack_app.action("agent_action_edit")
+def edit_agent_action(ack: Any, body: dict[str, Any], client: WebClient) -> None:
+    ack()
+    action_id = _raw_action_value(body)
+    pending = router.get_pending_agent_action(action_id)
+    metadata = {
+        "action_id": action_id,
+        "channel_id": _action_channel_id(body),
+        "message_ts": _action_message_ts(body),
+    }
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "agent_action_edit_submit",
+            "private_metadata": json.dumps(metadata),
+            "title": {"type": "plain_text", "text": "Edit MCP Action"},
+            "submit": {"type": "plain_text", "text": "Save"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "agent_parameters_block",
+                    "label": {"type": "plain_text", "text": "Tool parameters (JSON)"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "agent_parameters",
+                        "multiline": True,
+                        "initial_value": json.dumps(pending.arguments, indent=2),
+                    },
+                }
+            ],
+        },
+    )
+
+
+@slack_app.view("agent_action_edit_submit")
+def submit_agent_action_edit(ack: Any, body: dict[str, Any], client: WebClient) -> None:
+    view = body.get("view") or {}
+    raw_parameters = (
+        ((view.get("state") or {}).get("values") or {})
+        .get("agent_parameters_block", {})
+        .get("agent_parameters", {})
+        .get("value", "{}")
+    )
+    try:
+        arguments = json.loads(raw_parameters)
+        if not isinstance(arguments, dict):
+            raise ValueError("Parameters must be a JSON object.")
+    except (json.JSONDecodeError, ValueError) as exc:
+        ack(response_action="errors", errors={"agent_parameters_block": str(exc)})
+        return
+
+    ack()
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    pending = router.edit_agent_action(
+        str(metadata["action_id"]),
+        arguments,
+        body.get("user", {}).get("id", "unknown"),
+    )
+    client.chat_update(
+        channel=str(metadata["channel_id"]),
+        ts=str(metadata["message_ts"]),
+        blocks=_build_pending_agent_action_blocks(
+            pending,
+            "Parameters updated. Review the revised MCP call before approval.",
+        ),
+        text="MCP action parameters updated",
     )
 
 
@@ -782,11 +1113,11 @@ def portfolio_deep_audit(ack: Any, body: dict[str, Any], client: WebClient) -> N
             "portfolio_deep_audit_requested",
             extra={"ticker": ticker, "user_id": user_id, "channel_id": channel_id},
         )
-        initial_message = "⚙️ *AlphaChannel Orchestrator: Initiating Audit Core...*"
+        initial_message = "⚙️ _AlphaChannel Orchestrator:_ Initiating Audit Core..."
         response = client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            blocks=_mrkdwn_section_blocks(initial_message),
+            blocks=_mrkdwn_stream_blocks(initial_message),
             text=f"AlphaChannel Orchestrator initiating Audit Core for {ticker}",
         )
         message_ts = response.get("ts")
@@ -803,9 +1134,9 @@ def portfolio_deep_audit(ack: Any, body: dict[str, Any], client: WebClient) -> N
             ticker=ticker,
             action_name="portfolio_deep_audit",
             progress_steps=[
-                "🔍 *SEC Node: Ingesting active filing footnotes...*",
-                "📈 *yFinance Node: Calculating option volatility skew adjustments...*",
-                "🤖 *Orchestrator: Synthesizing final divergence alignment scorecard...*",
+                "🔍 _SEC Node:_ Ingesting active filing footnotes...",
+                "📈 _yFinance Node:_ Calculating option volatility skew adjustments...",
+                "🤖 _Orchestrator:_ Synthesizing final divergence alignment scorecard...",
             ],
             final_message=(
                 f"✅ *Audit Complete for {ticker}* \n\n"
@@ -839,11 +1170,11 @@ def portfolio_trim_allocation(ack: Any, body: dict[str, Any], client: WebClient)
             "portfolio_trim_allocation_requested",
             extra={"ticker": ticker, "user_id": user_id, "channel_id": channel_id},
         )
-        initial_message = "⚙️ *AlphaChannel Orchestrator: Initiating Trim Core...*"
+        initial_message = "⚙️ _AlphaChannel Orchestrator:_ Initiating Trim Core..."
         response = client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            blocks=_mrkdwn_section_blocks(initial_message),
+            blocks=_mrkdwn_stream_blocks(initial_message),
             text=f"AlphaChannel Orchestrator initiating Trim Core for {ticker}",
         )
         message_ts = response.get("ts")
@@ -860,8 +1191,8 @@ def portfolio_trim_allocation(ack: Any, body: dict[str, Any], client: WebClient)
             ticker=ticker,
             action_name="portfolio_trim_allocation",
             progress_steps=[
-                "⚡ *Trading Node:* Calculating current portfolio delta and liquidity boundaries...",
-                "📝 *Compliance Node:* Generating verified audit trail snapshot for governance review...",
+                "⚡ _Trading Node:_ Calculating current portfolio delta and liquidity boundaries...",
+                "📝 _Compliance Node:_ Generating verified audit trail snapshot for governance review...",
             ],
             final_message=f"📉 *Order Complete:* Successfully queued position adjustment framework for {ticker}.",
             final_blocks=_portfolio_trim_result_blocks(ticker),
