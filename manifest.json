@@ -1,0 +1,38 @@
+{
+  "display_information": {
+    "name": "AlphaChannel",
+    "description": "Governance and risk alignment agent for corporate blind-spot detection.",
+    "background_color": "#0B1F1A"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "AlphaChannel",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "chat:write",
+        "assistant:write",
+        "search:read.public",
+        "search:read.files",
+        "search:read.users"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

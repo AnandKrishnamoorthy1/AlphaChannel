@@ -1,0 +1,26 @@
+{
+  "account_id": "default",
+  "cash_balance": 10000.0,
+  "positions": {
+    "NVDA": {
+      "shares": 16,
+      "entry_price": 194.83,
+      "current_price": 194.83
+    },
+    "TSLA": {
+      "shares": 1,
+      "entry_price": 393.45,
+      "current_price": 393.45
+    },
+    "AMD": {
+      "shares": 1,
+      "entry_price": 539.49,
+      "current_price": 539.49
+    },
+    "QCOM": {
+      "shares": 1,
+      "entry_price": 184.79,
+      "current_price": 184.79
+    }
+  }
+}

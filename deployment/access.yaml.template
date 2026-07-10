@@ -1,0 +1,17 @@
+# Alibaba Cloud Serverless Devs Access Configuration
+# 
+# IMPORTANT: This file contains your Alibaba Cloud credentials (AccessKey ID and Secret).
+# It is NEVER committed to git (.gitignore prevents this).
+# Keep this file secure and never share it.
+#
+# To set up:
+# 1. Go to Alibaba Cloud Console (https://console.aliyun.com)
+# 2. Account Management → AccessKey Management
+# 3. Create or copy your AccessKey ID and Secret
+# 4. Replace the placeholders below
+# 5. Save to: ~/.s/access.yaml (usually C:\Users\<YourUsername>\.s\access.yaml on Windows)
+
+alibaba:
+  access_key_id: YOUR_ACCESS_KEY_ID_HERE
+  access_key_secret: YOUR_ACCESS_KEY_SECRET_HERE
+  region: us-east-1  # or ap-southeast-1, cn-hangzhou, etc.

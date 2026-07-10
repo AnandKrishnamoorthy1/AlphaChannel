@@ -1,0 +1,9 @@
+slack-bolt>=1.20.1
+dashscope>=1.14.0
+openai>=1.68.0
+qwen-agent>=0.0.27
+yfinance>=0.2.52
+langgraph>=0.2.60
+pydantic>=2.7.4
+python-dotenv>=1.0.1
+pypdf>=4.3.1

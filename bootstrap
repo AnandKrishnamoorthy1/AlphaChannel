@@ -1,0 +1,10 @@
+﻿#!/usr/bin/env bash
+# Alibaba Cloud FC Custom Runtime Bootstrap
+# Serverless Devs + s build --use-docker handles all dependency packaging
+# This starts your FastAPI server on port 9000 (required by Alibaba Cloud FC health checks)
+
+cd /code
+
+# Port 9000 is required by Alibaba Cloud Function Compute
+# The health check probes this port; if unresponsive for 120s, the instance is killed
+exec python3 -m uvicorn backend:app --host 0.0.0.0 --port 9000
