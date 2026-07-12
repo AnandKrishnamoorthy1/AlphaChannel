@@ -13,7 +13,7 @@ The Stop-Loss/Take-Profit skill provides real-time monitoring of portfolio posit
 
 ### Step 1: Check Concentration Triggers
 - Monitor each position as % of total portfolio
-- **Default threshold: 50%** (easily demonstrable)
+- **Policy threshold: 15%** of total portfolio equity per stock
 - Alert if any single position exceeds threshold
 - Recommend position reduction action
 
@@ -24,19 +24,23 @@ The Stop-Loss/Take-Profit skill provides real-time monitoring of portfolio posit
 
 ### Step 3: Check Stop-Loss Triggers
 - Monitor unrealized losses on each position
-- **Default threshold: -10%** (triggered if down 10%)
+- **Policy threshold: -20%** unrealized return on cost basis
 - Recommend exit if threshold breached
 
 ### Step 4: Check Take-Profit Triggers
 - Monitor unrealized gains on each position
-- **Default threshold: +30%** (triggered if up 30%)
+- **Policy threshold: +50%** unrealized return on cost basis
 - Recommend profit-taking if threshold breached
 
 ### Step 5: Liquidity Constraint Check
 - Verify recommended position exits won't cause liquidity issues
 - Warn if selling would exceed 5% portfolio volume in single day
 
-### Step 6: Generate Alerts & Recommendations
+### Step 6: Sector Concentration Check
+- Group holdings by sector or stock group.
+- Alert when any sector exceeds 30% of total portfolio equity.
+
+### Step 7: Generate Alerts & Recommendations
 - Return list of active triggers
 - Provide specific, actionable recommendations
 - Rank triggers by severity (HIGH / MEDIUM / LOW)
@@ -79,12 +83,13 @@ result = trigger_engine.assess_all_triggers(
 3. **Pre-IC Analysis**: Before debate, alert IC to active concentration breaches
 4. **Risk Dashboard**: Real-time trigger summary
 
-## Thresholds (Demonstration-Friendly)
+## Portfolio Policy Thresholds
 
-- **Concentration Alert**: 50% (instead of 75% for easy demo)
-- **Stop-Loss Alert**: -10% unrealized loss
-- **Take-Profit Alert**: +30% unrealized gain
-- **Correlation Alert**: >0.7 with combined >30% concentration
+- **Single-stock alert**: greater than 15% of total portfolio equity
+- **Sector/group alert**: greater than 30% of total portfolio equity
+- **Stop-loss alert**: below -20% versus average cost
+- **Take-profit alert**: above +50% versus average cost
+- **Correlation alert**: retained as secondary context when correlated positions are material
 
 ## Integration Points
 

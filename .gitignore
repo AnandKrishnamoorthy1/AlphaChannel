@@ -80,6 +80,10 @@ env/
 # ============================================================================
 logs/
 *.log
+.data/
+data/*.db
+data/*.db-*
+.edgar-data/
 *.pot
 *.mo
 .webassets-cache

@@ -28,12 +28,24 @@
         },
         {
           "name": "yfinance_risk_lookup",
-          "description": "Fetch live price, option-chain implied volatility, positioning, and market risk markers for a public-company ticker.",
+          "description": "Fetch options volatility, put/call positioning, and derivatives risk. Use only when the user explicitly asks about options, volatility, hedging, or trading.",
           "read_only": true,
           "requires_approval": false,
           "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string", "description": "Market ticker, such as NOW or NU"}},
+            "required": ["ticker"],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "yfinance_fundamental_lookup",
+          "description": "Fetch investment fundamentals for a public company: current price, market cap, revenue, revenue growth, earnings growth, trailing and forward P/E, profit margin, ROE, debt-to-equity, and valuation risk markers.",
+          "read_only": true,
+          "requires_approval": false,
+          "input_schema": {
+            "type": "object",
+            "properties": {"ticker": {"type": "string", "description": "Market ticker, such as NET, META, or NU"}},
             "required": ["ticker"],
             "additionalProperties": false
           }

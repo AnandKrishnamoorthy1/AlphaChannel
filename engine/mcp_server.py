@@ -21,7 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from engine.sec_node import SecEdgarClient, SecRiskExtractor
 from engine.trading_node import TradingNode
-from engine.yfinance_node import YahooFinanceOptionsWorker
+from engine.yfinance_node import YahooFinanceFundamentalsWorker, YahooFinanceOptionsWorker
 
 MAX_OUTPUT_CHARS = 12_000
 
@@ -92,6 +92,17 @@ def yfinance_risk_lookup(ticker: str) -> dict[str, object]:
 
 
 @mcp.tool()
+def yfinance_fundamental_lookup(ticker: str) -> dict[str, object]:
+    """Fetch investment fundamentals: valuation, revenue, growth, margins, ROE, leverage, and price."""
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker or len(normalized_ticker) > 10:
+        raise ValueError("ticker must be a valid market symbol")
+    result = YahooFinanceFundamentalsWorker().fetch_fundamental_signal(normalized_ticker).model_dump(mode="json")
+    result["source_url"] = f"https://finance.yahoo.com/quote/{normalized_ticker}/key-statistics"
+    return result
+
+
+@mcp.tool()
 def sec_risk_lookup(ticker: str, filing_text: str = "") -> dict[str, object]:
     """Fetch the latest SEC 10-K, 10-Q, 20-F, or 6-K and extract risk markers, or parse supplied text."""
     normalized_ticker = ticker.strip().upper()
@@ -124,8 +135,8 @@ def sec_risk_lookup(ticker: str, filing_text: str = "") -> dict[str, object]:
 
 @mcp.tool()
 def portfolio_holdings() -> dict[str, object]:
-    """Return AlphaChannel's current institutional portfolio holdings and exposure statuses."""
-    return {"holdings": TradingNode().get_portfolio_holdings()}
+    """Return the stock-only Robinhood Agentic Account snapshot."""
+    return TradingNode().get_portfolio_snapshot(refresh_market_data=True).model_dump(mode="json")
 
 
 @mcp.tool()

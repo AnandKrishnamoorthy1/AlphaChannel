@@ -32,8 +32,7 @@ class Trigger:
 class ConcentrationTriggerDetector:
     """Detects when positions exceed concentration thresholds."""
     
-    # LOWER THRESHOLD FOR EASY DEMO: 20% for earlier trigger detection
-    DEFAULT_CONCENTRATION_THRESHOLD = 0.20
+    DEFAULT_CONCENTRATION_THRESHOLD = 0.15
     
     @staticmethod
     def check_concentration(positions: List[Dict[str, Any]], threshold: float = None) -> List[Dict[str, Any]]:
@@ -76,6 +75,49 @@ class ConcentrationTriggerDetector:
                 })
         
         return sorted(triggers, key=lambda x: x["current_pct"], reverse=True)
+
+
+class SectorConcentrationTriggerDetector:
+    """Detect sector or stock-group exposure above the portfolio policy limit."""
+
+    DEFAULT_SECTOR_THRESHOLD = 0.30
+
+    @staticmethod
+    def check_sector_concentration(
+        positions: List[Dict[str, Any]],
+        threshold: float = DEFAULT_SECTOR_THRESHOLD,
+        total_portfolio_value: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        sector_values: Dict[str, float] = defaultdict(float)
+        total_value = total_portfolio_value or sum(float(position.get("value", 0) or 0) for position in positions)
+        if total_value <= 0:
+            return []
+
+        for position in positions:
+            sector = str(position.get("sector") or "Unknown")
+            sector_values[sector] += float(position.get("value", 0) or 0)
+
+        triggers: List[Dict[str, Any]] = []
+        for sector, value in sector_values.items():
+            weight = value / total_value
+            if weight <= threshold:
+                continue
+            triggers.append(
+                {
+                    "type": "sector_concentration_breach",
+                    "sector": sector,
+                    "severity": AlertSeverity.HIGH.value,
+                    "current_pct": round(weight * 100, 2),
+                    "threshold_pct": round(threshold * 100, 2),
+                    "excess_value": round(value - (total_value * threshold), 2),
+                    "recommendation": (
+                        f"Reduce {sector} exposure below {threshold * 100:.0f}% of portfolio "
+                        f"(currently {weight * 100:.1f}%)."
+                    ),
+                    "reason": f"Sector exposure exceeds {threshold * 100:.0f}% policy limit",
+                }
+            )
+        return sorted(triggers, key=lambda item: item["current_pct"], reverse=True)
 
 
 class CorrelationSpikeDetector:
@@ -161,8 +203,8 @@ class CorrelationSpikeDetector:
 class ProfitLossTriggerDetector:
     """Detects stop-loss and take-profit thresholds."""
     
-    STOP_LOSS_PCT = -0.10  # -10%
-    TAKE_PROFIT_PCT = 0.30  # +30%
+    STOP_LOSS_PCT = -0.20  # -20% on cost basis
+    TAKE_PROFIT_PCT = 0.50  # +50% on cost basis
     
     @staticmethod
     def check_stop_loss(portfolio_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -242,9 +284,23 @@ class ProfitLossTriggerDetector:
 class StopLossTakeProfitEngine:
     """Main entry point for stop-loss/take-profit monitoring."""
     
-    def __init__(self, concentration_threshold: Optional[float] = None):
-        self.concentration_threshold = concentration_threshold or ConcentrationTriggerDetector.DEFAULT_CONCENTRATION_THRESHOLD
+    def __init__(
+        self,
+        concentration_threshold: Optional[float] = None,
+        sector_threshold: Optional[float] = None,
+    ):
+        self.concentration_threshold = (
+            concentration_threshold
+            if concentration_threshold is not None
+            else ConcentrationTriggerDetector.DEFAULT_CONCENTRATION_THRESHOLD
+        )
+        self.sector_threshold = (
+            sector_threshold
+            if sector_threshold is not None
+            else SectorConcentrationTriggerDetector.DEFAULT_SECTOR_THRESHOLD
+        )
         self.concentration_detector = ConcentrationTriggerDetector()
+        self.sector_detector = SectorConcentrationTriggerDetector()
         self.correlation_detector = CorrelationSpikeDetector()
         self.profit_loss_detector = ProfitLossTriggerDetector()
     
@@ -280,6 +336,11 @@ class StopLossTakeProfitEngine:
                 positions,
                 threshold=self.concentration_threshold
             )
+            sector_triggers = self.sector_detector.check_sector_concentration(
+                positions,
+                threshold=self.sector_threshold,
+                total_portfolio_value=portfolio.get("total_value"),
+            )
             
             correlation_triggers = self.correlation_detector.check_correlation_spikes(positions)
             
@@ -290,6 +351,7 @@ class StopLossTakeProfitEngine:
             # Combine and rank by severity
             all_triggers = (
                 concentration_triggers +
+                sector_triggers +
                 correlation_triggers +
                 stop_loss_triggers +
                 take_profit_triggers
@@ -310,6 +372,7 @@ class StopLossTakeProfitEngine:
                 "triggers": all_triggers,
                 "summary": trigger_summary,
                 "concentration_threshold_pct": self.concentration_threshold * 100,
+                "sector_threshold_pct": self.sector_threshold * 100,
                 "status": "triggers_found" if all_triggers else "no_triggers"
             }
             

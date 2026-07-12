@@ -5,13 +5,13 @@
 <h2 align="center">Catch the risk your deal room cannot see.</h2>
 
 <p align="center">
-  <strong>AlphaChannel</strong> turns Slack into a stateful institutional risk console. It contrasts internal conviction with live SEC EDGAR disclosures and Yahoo Finance MCP options-market signals, then routes consequential decisions through human approval.
+  <strong>AlphaChannel</strong> turns Slack into a stateful institutional risk console. It contrasts internal conviction with live SEC EDGAR disclosures and Yahoo Finance MCP valuation and growth fundamentals, then routes consequential decisions through human approval.
 </p>
 
 <p align="center">
   <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" />
   <img alt="Slack Bolt and Socket Mode" src="https://img.shields.io/badge/Slack-Bolt%20%2B%20Socket%20Mode-4A154B?logo=slack&logoColor=white" />
-  <img alt="Qwen" src="https://img.shields.io/badge/AI-Qwen-615CED" />
+  <img alt="Gemini" src="https://img.shields.io/badge/AI-Gemini-4285F4" />
   <img alt="Model Context Protocol" src="https://img.shields.io/badge/MCP-FastMCP-159570" />
   <img alt="SEC EDGAR" src="https://img.shields.io/badge/data-SEC%20EDGAR-B31B1B" />
   <img alt="Human approval required" src="https://img.shields.io/badge/trades-human%20approval%20required-1F883D" />
@@ -32,7 +32,7 @@
 
 ## The problem
 
-Investment and corporate strategy teams make consequential decisions inside fast-moving Slack threads. Confidence compounds quickly, while the evidence that should challenge it is scattered across filing footnotes, options chains, and disconnected research systems.
+Investment and corporate strategy teams make consequential decisions inside fast-moving Slack threads. Confidence compounds quickly, while the evidence that should challenge it is scattered across filing footnotes, valuation metrics, growth data, and disconnected research systems.
 
 That creates an **executive blind spot**: internal consensus can remain bullish while liquidity pressure, litigation exposure, disclosure changes, or volatility skew tells a different story.
 
@@ -49,7 +49,7 @@ Ask an open-ended question in a channel or the Agent View:
 AlphaChannel then:
 
 1. Retains the request as part of the Slack thread's conversation state.
-2. Lets Qwen select the evidence it needs from registered MCP tool schemas.
+2. Lets Gemini select the evidence it needs from registered MCP tool schemas.
 3. Fetches live market structure from yFinance and the latest relevant filing from SEC EDGAR.
 4. Streams each research step into one updating Slack message without blocking Socket Mode.
 5. Cross-examines internal perception against external evidence and validates the result with Pydantic.
@@ -64,7 +64,7 @@ The **Portfolio Center** provides the same interaction model across institutiona
 
 ## Why it is an agent
 
-AlphaChannel is not a command-to-script switchboard. The Qwen planning loop is the central dispatcher.
+AlphaChannel is not a command-to-script switchboard. `GeminiOrchestrationBrain` is the central dispatcher.
 
 - **Goal-oriented planning:** the model receives the user's goal, thread memory, workspace perception, and available MCP tool schemas.
 - **Autonomous tool choice:** read-only research tools can run without a hardcoded execution graph.
@@ -82,7 +82,7 @@ AlphaChannel is not a command-to-script switchboard. The Qwen planning loop is t
  Slack Bolt + Socket Mode ---- Slack Real-Time Search context
             |
             v
- Qwen planning and reasoning loop <-------------------------+
+ GeminiOrchestrationBrain <-------------------------------+
             |                                                |
             v                                                |
  MCP tool selection                                          |
@@ -104,13 +104,14 @@ AlphaChannel is not a command-to-script switchboard. The Qwen planning loop is t
 | Layer | Responsibility |
 | --- | --- |
 | [`app.py`](app.py) | Slack events, Agent View, Real-Time Search, Block Kit, and background callbacks |
-| [`engine/agent_brain.py`](engine/agent_brain.py) | Qwen planning, MCP tool-call loop, and typed final synthesis |
-| [`engine/core_router.py`](engine/core_router.py) | Thread memory, action continuations, and orchestration contracts |
+| [`engine/core_router.py`](engine/core_router.py) | Gemini-native planning, MCP tool-call loop, thread memory, action continuations, and typed final synthesis |
 | [`engine/mcp_client.py`](engine/mcp_client.py) | MCP transport, schema exposure, and execution policy enforcement |
 | [`engine/mcp_server.py`](engine/mcp_server.py) | Registered finance, filing, repository, diagnostic, and checkpoint tools |
 | [`engine/sec_node.py`](engine/sec_node.py) | Live SEC EDGAR resolution, filing retrieval, parsing, and risk extraction |
-| [`engine/yfinance_node.py`](engine/yfinance_node.py) | Price, options-chain, implied-volatility, and skew signals |
+| [`engine/yfinance_node.py`](engine/yfinance_node.py) | Investment fundamentals plus optional options and implied-volatility signals |
 | [`engine/trading_node.py`](engine/trading_node.py) | Portfolio state and human-governed mitigation checkpoints |
+
+The primary runtime brain is `GeminiOrchestrationBrain` in [`engine/core_router.py`](engine/core_router.py). It dynamically selects registered MCP tools, receives their results, continues multi-turn reasoning, and emits the validated risk synthesis. LangGraph remains in the same module only as a compatibility path for the older `run_assessment()` workflow; it is not the primary Slack agent loop.
 
 For deeper implementation notes, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -118,7 +119,7 @@ For deeper implementation notes, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### Live perception-vs-reality analysis
 
-Slack Real-Time Search provides relevant messages, files, and surrounding context as the **Internal Workspace Perception**. Qwen cross-examines that material against live **External Reality** evidence from SEC filings and market structure, explicitly flagging material divergence.
+Slack Real-Time Search provides relevant messages, files, and surrounding context as the **Internal Workspace Perception**. Gemini cross-examines that material against live **External Reality** evidence from SEC filings and Yahoo Finance MCP fundamentals, explicitly flagging material divergence.
 
 ### Multi-threaded progress UI
 
@@ -128,9 +129,19 @@ Slack interactions are acknowledged immediately. SEC, yFinance, and LLM work run
 
 The Portfolio Center renders institutional holdings as Block Kit layouts with allocation state, Deep Audit, and Trim controls. A deep audit re-enters the same agentic evidence loop rather than returning a static portfolio message.
 
+The Portfolio Monitoring skill evaluates each refreshed snapshot against explicit policy limits: stop-loss below `-20%` versus average cost, profit alert above `+50%` versus average cost, single-stock concentration above `15%` of portfolio equity, and sector or stock-group concentration above `30%`. Alerts produce recommendations only; any sell or rebalance remains an approval-gated dry-run checkpoint.
+
 ### Human-in-the-loop guardrails
 
 AlphaChannel does **not** place autonomous trades. Buy, sell, hedge, test, and diagnostic recommendations become explicit checkpoints with editable parameters and a retained audit trail.
+
+### Brokerage integrations
+
+Users can connect a separately governed brokerage platform such as Robinhood, Webull, or another supported trading service through its official API or an MCP server. AlphaChannel's default implementation remains a dry-run checkpoint: broker credentials are not required, no live order is submitted, and any future API/MCP execution adapter must preserve explicit human approval, scoped permissions, and an auditable order trail.
+
+### Portfolio persistence and live prices
+
+The Portfolio Center stores account cash and equity positions in SQLite at `data/portfolio.db` by default. The file is ignored by Git and should live on a persistent application volume in a single-instance deployment. Each dashboard refresh attempts to replace stored demo prices with Yahoo Finance MCP prices and labels the source in Slack; fallback prices are used only when the provider is unavailable. For multi-instance or high-write production deployments, use a managed PostgreSQL-backed repository instead of sharing a SQLite file across containers.
 
 ## Quick start
 
@@ -156,8 +167,9 @@ DASHSCOPE_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen3.6-flash
 QWEN_TIMEOUT_SECONDS=30
 
-# SEC requires an identifiable organization and monitored contact address.
-SEC_EDGAR_USER_AGENT=AlphaChannel your-email@example.com
+# EdgarTools requires an identifiable organization and monitored contact address.
+EDGAR_IDENTITY=AlphaChannel your-email@example.com
+SEC_EDGAR_BACKEND=edgartools
 
 LOG_LEVEL=INFO
 ALPHACHANNEL_RTS_LIMIT=12
@@ -179,14 +191,14 @@ Validate the complete live-data path before a demo:
 python scripts/golden_path_smoke_test.py
 ```
 
-The smoke test succeeds only when Qwen autonomously invokes both `yfinance_risk_lookup` and `sec_risk_lookup`, receives valid MCP observations, and returns a validated synthesis.
+The smoke test succeeds only when Gemini autonomously invokes `yfinance_fundamental_lookup` and `sec_risk_lookup`, receives valid MCP observations, and returns a validated synthesis.
 
 ## Security and governance
 
 - Slack action tokens remain ephemeral request parameters and are never treated as bearer credentials.
 - Secrets are read from `.env` or the deployment environment and excluded from structured logs.
-- SEC requests use a declared identity, bounded request frequency, and official EDGAR endpoints.
-- Qwen calls use configured regional endpoints, timeouts, typed output validation, and clean fallbacks.
+- SEC filings are retrieved through the maintained EdgarTools API, with declared identity, bounded request frequency, and official EDGAR endpoints. Set `SEC_EDGAR_BACKEND=raw` only for emergency compatibility testing.
+- Gemini calls use configured model settings, timeouts, typed output validation, and clean fallbacks.
 - MCP policies distinguish autonomous read-only tools from consequential tools that require approval.
 - Trading controls are dry-run governance checkpoints; a separately governed broker integration is required for execution.
 - Thread state is process-local for the hackathon runtime. A multi-instance deployment should use Redis or another shared checkpoint store.

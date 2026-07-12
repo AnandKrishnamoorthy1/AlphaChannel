@@ -170,7 +170,8 @@ def invoke_skill(skill_name: str, **kwargs) -> Dict[str, Any]:
     elif skill_name == "stop_loss_take_profit":
         from skills.stop_loss_take_profit.trigger_tools import StopLossTakeProfitEngine
         engine = StopLossTakeProfitEngine(
-            concentration_threshold=kwargs.get("concentration_threshold", 0.50)
+            concentration_threshold=kwargs.get("concentration_threshold", 0.15),
+            sector_threshold=kwargs.get("sector_threshold", 0.30),
         )
         
         # Check if this is pre-trade validation or regular assessment

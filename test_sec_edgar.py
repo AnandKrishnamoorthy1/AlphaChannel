@@ -30,7 +30,7 @@ class FakeSecEdgarClient(SecEdgarClient):
 
 
 def test_latest_sec_filing_is_resolved_and_parsed() -> None:
-    client = FakeSecEdgarClient(user_agent="AlphaChannel test@example.com")
+    client = FakeSecEdgarClient(user_agent="AlphaChannel test@example.com", backend="raw")
     filing = client.fetch_latest_filing("now")
 
     assert filing.form == "10-Q"
@@ -42,5 +42,5 @@ def test_latest_sec_filing_is_resolved_and_parsed() -> None:
 
 
 def test_sec_client_requires_declared_identity() -> None:
-    with pytest.raises(RuntimeError, match="SEC_EDGAR_USER_AGENT"):
+    with pytest.raises(RuntimeError, match="EDGAR_IDENTITY"):
         SecEdgarClient(user_agent=" ").fetch_latest_filing("NOW")

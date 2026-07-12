@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import uuid
@@ -15,9 +16,11 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from engine.agent_brain import BrainRunResult, QwenAgentBrain
+from engine.agent_brain import BrainRunResult
 from engine.sec_node import SecRiskExtractor, SecRiskMarker
 from engine.mcp_client import AlphaChannelMCPClient, MCPToolExecution
 from engine.trading_node import TargetMitigationOrder, TradingNode
@@ -123,6 +126,14 @@ class AgentTurnRequest(BaseModel):
     workspace_context: str | None = Field(default=None, max_length=20_000)
 
 
+class DirectTradeIntent(BaseModel):
+    """Explicit trade request routed directly to the approval boundary."""
+
+    ticker: str
+    side: Literal["buy", "sell", "hedge"]
+    notional_usd: float | None = Field(default=None, gt=0)
+
+
 class ConversationTurn(BaseModel):
     role: Literal["user", "assistant", "tool"]
     content: str
@@ -148,6 +159,549 @@ class AgentTurnResponse(BaseModel):
     tool_executions: list[MCPToolExecution] = Field(default_factory=list)
     pending_action: PendingToolAction | None = None
     conversation_turn_count: int
+
+
+class GeminiRiskSynthesis(BaseModel):
+    """Strict governance contract returned by Gemini structured output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    internal_consensus_percent: int = Field(ge=0, le=100)
+    external_risk_markers: list[str] = Field(min_length=0, max_length=12)
+    divergence_analysis: str = Field(min_length=1, max_length=3000)
+    verdict: str = Field(
+        min_length=1,
+        max_length=32,
+        json_schema_extra={"enum": ["BUY", "SELL", "HOLD", "TRIMMING_REQUIRED"]},
+    )
+    recommended_actions: list[str] = Field(min_length=0, max_length=8)
+
+    @field_validator("verdict")
+    @classmethod
+    def validate_verdict(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        allowed = {"BUY", "SELL", "HOLD", "TRIMMING_REQUIRED"}
+        if normalized not in allowed:
+            raise ValueError(f"verdict must be one of {sorted(allowed)}")
+        return normalized
+
+    def as_slack_message(self) -> str:
+        markers = "\n".join(f"- {item}" for item in self.external_risk_markers)
+        actions = "\n".join(f"- {item}" for item in self.recommended_actions)
+        return (
+            f"*Internal consensus:* {self.internal_consensus_percent}%\n"
+            f"*Verdict:* {self.verdict}\n\n"
+            f"*Perception vs. reality*\n{self.divergence_analysis}\n\n"
+            f"*External risk markers*\n{markers or '- No material marker returned'}\n\n"
+            f"*Recommended actions*\n{actions or '- Continue monitoring'}"
+        )
+
+
+class AssetResolution(BaseModel):
+    """LLM-resolved security target, isolated from noisy workspace context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str | None = Field(default=None, max_length=12)
+    company_name: str | None = Field(default=None, max_length=200)
+    confidence: float = Field(ge=0, le=1)
+    ambiguous: bool = False
+
+
+class GeminiBrainRunResult(BaseModel):
+    message: str
+    executions: list[MCPToolExecution] = Field(default_factory=list)
+    pending_tool_name: str | None = None
+    pending_arguments: dict[str, Any] = Field(default_factory=dict)
+    pending_tool_call_id: str | None = None
+    continuation_messages: list[dict[str, Any]] = Field(default_factory=list)
+    synthesis: GeminiRiskSynthesis | None = None
+
+
+class GeminiOrchestrationBrain:
+    """Gemini-native planner that delegates all intent selection to function calling."""
+
+    SYSTEM_INSTRUCTION = """You are AlphaChannel's institutional governance orchestrator.
+Select the registered MCP tools needed to satisfy the user's goal. Use live yFinance and SEC tools for
+public-company financial risk questions, portfolio tools for holdings questions, and transaction tools only
+when the user explicitly requests a consequential action. Never fabricate tool observations. Select exactly
+one function per reasoning turn. The host enforces execution policy and human approval. When sufficient
+evidence has been collected, stop calling functions so the host can request the final structured synthesis.
+For an investment or risk assessment, MUST use yfinance_fundamental_lookup for valuation and operating metrics
+(P/E, revenue, growth, margins, ROE, debt-to-equity) and sec_risk_lookup for filing evidence. Never use
+yfinance_risk_lookup for a normal investment assessment; that tool is only for explicit options, volatility,
+hedging, or trading requests.
+Never call git_history, system_status, or run_diagnostic for a financial or portfolio request unless the user
+explicitly asks about repository code, runtime health, logs, or tests. Do not repeat the same tool with the same
+arguments. For a simple holdings request, portfolio_holdings alone is sufficient."""
+
+    FINAL_SYNTHESIS_INSTRUCTION = (
+        "Using only the workspace context and MCP observations in this conversation, produce the final "
+        "institutional perception-versus-reality risk assessment. Return every field required by the schema."
+    )
+
+    ASSET_RESOLUTION_INSTRUCTION = """Extract the investment asset explicitly requested in the user's goal.
+Resolve company names, common aliases, exchange symbols, and obvious spelling mistakes. Ignore every company
+or ticker mentioned in the workspace context; it is not part of asset identity. Return ticker=null and
+ambiguous=true if the goal names multiple plausible securities or cannot be resolved confidently. Do not
+invent a ticker."""
+
+    ASSET_ALIASES = {
+        "meta platforms": "META",
+        "facebook": "META",
+        "meta": "META",
+        "cloudflare": "NET",
+        "net": "NET",
+        "nubank": "NU",
+        "service now": "NOW",
+        "servicenow": "NOW",
+    }
+
+    def __init__(
+        self,
+        mcp_client: AlphaChannelMCPClient,
+        *,
+        client: Any | None = None,
+        max_iterations: int = 6,
+    ) -> None:
+        self.mcp_client = mcp_client
+        self.client = client or genai.Client()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+        self.max_iterations = max_iterations
+        self.max_tool_calls = max(1, int(os.getenv("GEMINI_MAX_TOOL_CALLS", "4")))
+
+    def run(
+        self,
+        *,
+        goal: str,
+        conversation: list[dict[str, str]],
+        workspace_context: str | None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> GeminiBrainRunResult:
+        contents: list[dict[str, Any]] = [
+            {
+                "role": "model" if message.get("role") == "assistant" else "user",
+                "parts": [{"text": message.get("content", "")}],
+            }
+            for message in conversation[-12:]
+        ]
+        context = (workspace_context or "No Slack RTS context was available.")[:20_000]
+        asset = self._resolve_requested_asset(goal)
+        requested_ticker = asset.ticker
+        options_requested = self._options_requested(goal)
+        portfolio_requested = self._portfolio_requested(goal)
+        target_instruction = (
+            f"LLM-resolved requested asset: {requested_ticker} ({asset.company_name or 'company name unavailable'}), "
+            f"confidence={asset.confidence:.2f}. This asset is authoritative. Do not substitute an asset "
+            "mentioned in Slack history."
+            if requested_ticker
+            else "No single requested asset was detected; follow the user's portfolio or engineering goal."
+        )
+        contents.append(
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": f"Goal:\n{goal}\n\n{target_instruction}\n\nInternal Workspace Perception:\n{context}",
+                    }
+                ],
+            }
+        )
+        logger.info(
+            "gemini_planning_started model=%s goal_chars=%d requested_asset=%s",
+            self.model,
+            len(goal),
+            requested_ticker,
+        )
+        if progress_callback:
+            progress_callback("Gemini is planning the investigation and selecting MCP evidence tools...")
+        return self._run_tool_loop(
+            contents,
+            [],
+            progress_callback,
+            expected_ticker=requested_ticker,
+            allowed_tool_names=self._allowed_tool_names(
+                options_requested=options_requested,
+                portfolio_requested=portfolio_requested,
+            ),
+        )
+
+    def _resolve_requested_asset(self, goal: str) -> AssetResolution:
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=[{"role": "user", "parts": [{"text": f"User goal:\n{goal}"}]}],
+                config=types.GenerateContentConfig(
+                    system_instruction=self.ASSET_RESOLUTION_INSTRUCTION,
+                    response_mime_type="application/json",
+                    response_json_schema=AssetResolution.model_json_schema(),
+                    temperature=0,
+                ),
+            )
+            parsed = getattr(response, "parsed", None)
+            if isinstance(parsed, AssetResolution):
+                return parsed
+            if parsed is not None:
+                return AssetResolution.model_validate(parsed)
+            return AssetResolution.model_validate_json(response.text or "")
+        except (ValidationError, ValueError, TypeError, RuntimeError) as exc:
+            fallback = self._extract_requested_ticker(goal)
+            logger.warning(
+                "gemini_asset_resolution_fallback error_type=%s fallback_ticker=%s",
+                type(exc).__name__,
+                fallback,
+            )
+            return AssetResolution(
+                ticker=fallback,
+                confidence=0.35 if fallback else 0.0,
+                ambiguous=fallback is None,
+            )
+
+    def resume(
+        self,
+        *,
+        continuation_messages: list[dict[str, Any]],
+        tool_call_id: str,
+        execution: MCPToolExecution,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> GeminiBrainRunResult:
+        contents = [
+            *continuation_messages,
+            self._function_response_content(tool_call_id, execution),
+        ]
+        logger.info(
+            "gemini_resumed_after_approval tool=%s tool_call_id=%s",
+            execution.tool_name,
+            tool_call_id,
+        )
+        expected_ticker = str(execution.arguments.get("ticker") or "").upper() or None
+        return self._run_tool_loop(
+            contents,
+            [execution],
+            progress_callback,
+            expected_ticker=expected_ticker,
+            allowed_tool_names=None,
+        )
+
+    def _run_tool_loop(
+        self,
+        contents: list[dict[str, Any]],
+        executions: list[MCPToolExecution],
+        progress_callback: Callable[[str], None] | None,
+        expected_ticker: str | None = None,
+        allowed_tool_names: set[str] | None = None,
+    ) -> GeminiBrainRunResult:
+        tools = self._gemini_tools(allowed_tool_names)
+        seen_tool_calls = {
+            (execution.tool_name, json.dumps(execution.arguments, sort_keys=True, default=str))
+            for execution in executions
+        }
+        for iteration in range(1, self.max_iterations + 1):
+            logger.info(
+                "gemini_reasoning_iteration iteration=%d observation_count=%d",
+                iteration,
+                len(executions),
+            )
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=self.SYSTEM_INSTRUCTION,
+                    tools=tools,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+                    ),
+                    temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.15")),
+                    top_p=float(os.getenv("GEMINI_TOP_P", "0.8")),
+                ),
+            )
+            function_calls = list(response.function_calls or [])
+            if len(function_calls) > 1:
+                logger.warning(
+                    "gemini_parallel_calls_rejected iteration=%d call_count=%d",
+                    iteration,
+                    len(function_calls),
+                )
+                contents.append(
+                    {
+                        "role": "user",
+                        "parts": [{"text": "Select exactly one MCP function for the next reasoning step."}],
+                    }
+                )
+                continue
+
+            if not function_calls:
+                contents.append(self._model_content(response))
+                if progress_callback:
+                    progress_callback("Gemini is producing the validated governance synthesis...")
+                synthesis = self._generate_structured_synthesis(contents)
+                logger.info(
+                    "gemini_synthesis_completed verdict=%s consensus=%d",
+                    synthesis.verdict,
+                    synthesis.internal_consensus_percent,
+                )
+                return GeminiBrainRunResult(
+                    message=synthesis.as_slack_message(),
+                    executions=executions,
+                    synthesis=synthesis,
+                )
+
+            function_call = function_calls[0]
+            tool_name = str(function_call.name or "")
+            arguments = dict(function_call.args or {})
+            tool_call_id = str(function_call.id or f"gemini-{uuid.uuid4()}")
+            contents.append(self._model_content(response, fallback_call_id=tool_call_id))
+            if tool_name == "yfinance_risk_lookup" and allowed_tool_names is not None:
+                tool_name = "yfinance_fundamental_lookup"
+                logger.warning("gemini_investment_data_guard_replaced_options_tool ticker=%s", expected_ticker)
+                contents.append(
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": (
+                                    "Host investment data guard: use yfinance_fundamental_lookup for this "
+                                    "investment assessment; options data is not relevant unless explicitly requested."
+                                )
+                            }
+                        ],
+                    }
+                )
+            if expected_ticker and tool_name in {
+                "yfinance_risk_lookup",
+                "yfinance_fundamental_lookup",
+                "sec_risk_lookup",
+            }:
+                selected_ticker = str(arguments.get("ticker") or "").strip().upper().lstrip("$")
+                if selected_ticker != expected_ticker:
+                    logger.warning(
+                        "gemini_asset_guard_corrected_tool_argument tool=%s selected=%s requested=%s",
+                        tool_name,
+                        selected_ticker or None,
+                        expected_ticker,
+                    )
+                    arguments["ticker"] = expected_ticker
+                    contents.append(
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "text": (
+                                        f"Host asset guard: execute {tool_name} for {expected_ticker}; "
+                                        f"the requested asset is authoritative, not {selected_ticker or 'an unknown asset'}."
+                                    )
+                                }
+                            ],
+                        }
+                    )
+
+            call_signature = (tool_name, json.dumps(arguments, sort_keys=True, default=str))
+            if call_signature in seen_tool_calls:
+                logger.warning(
+                    "gemini_duplicate_tool_call_blocked tool=%s arguments=%s",
+                    tool_name,
+                    json.dumps(arguments, sort_keys=True, default=str),
+                )
+                duplicate_execution = MCPToolExecution(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    output=json.dumps(
+                        {
+                            "error": "duplicate_tool_call_blocked",
+                            "message": "This exact MCP lookup already ran in the current assessment.",
+                        }
+                    ),
+                    is_error=True,
+                )
+                contents.append(self._function_response_content(tool_call_id, duplicate_execution))
+                synthesis = self._generate_structured_synthesis(contents)
+                return GeminiBrainRunResult(
+                    message=synthesis.as_slack_message(),
+                    executions=executions,
+                    synthesis=synthesis,
+                )
+            seen_tool_calls.add(call_signature)
+            policy = self.mcp_client.policy_for(tool_name)
+            logger.info(
+                "gemini_tool_selected iteration=%d tool=%s read_only=%s requires_approval=%s arguments=%s",
+                iteration,
+                tool_name,
+                policy.read_only,
+                policy.requires_approval,
+                json.dumps(arguments, sort_keys=True, default=str),
+            )
+            if progress_callback:
+                progress_callback(f"Gemini selected {tool_name}; checking governance policy...")
+
+            if policy.requires_approval or not policy.read_only:
+                return GeminiBrainRunResult(
+                    message=(
+                        f"Gemini selected `{tool_name}`. This consequential action is paused pending "
+                        "human approval."
+                    ),
+                    executions=executions,
+                    pending_tool_name=tool_name,
+                    pending_arguments=arguments,
+                    pending_tool_call_id=tool_call_id,
+                    continuation_messages=contents,
+                )
+
+            if progress_callback:
+                progress_callback(f"Running {tool_name} through the persistent MCP session...")
+            execution = self.mcp_client.call_tool(tool_name, arguments)
+            executions.append(execution)
+            contents.append(self._function_response_content(tool_call_id, execution))
+            if progress_callback:
+                progress_callback(f"MCP returned {tool_name} evidence; Gemini is evaluating it...")
+            if len(executions) >= self.max_tool_calls:
+                if progress_callback:
+                    progress_callback("Evidence budget reached; Gemini is finalizing the risk synthesis...")
+                synthesis = self._generate_structured_synthesis(contents)
+                return GeminiBrainRunResult(
+                    message=synthesis.as_slack_message(),
+                    executions=executions,
+                    synthesis=synthesis,
+                )
+
+        raise RuntimeError(f"Gemini exceeded the {self.max_iterations}-iteration safety limit.")
+
+    @classmethod
+    def _extract_requested_ticker(cls, goal: str) -> str | None:
+        normalized = goal.lower()
+        for alias, ticker in sorted(cls.ASSET_ALIASES.items(), key=lambda item: -len(item[0])):
+            if re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", normalized):
+                return ticker
+
+        excluded = {
+            "RUN", "RISK", "ASSESSMENT", "ASSESS", "ANALYZE", "ANALYSIS",
+            "CHECK", "STOCK", "SHARES", "THE", "FOR",
+        }
+        for candidate in re.findall(r"(?<![A-Za-z])\$?([A-Z]{1,5})(?![A-Za-z])", goal):
+            if candidate not in excluded:
+                return candidate
+        return None
+
+    def _gemini_tools(self, allowed_tool_names: set[str] | None = None) -> list[types.Tool]:
+        declarations = [
+            types.FunctionDeclaration(**definition)
+            for definition in self.mcp_client.gemini_function_declarations()
+            if allowed_tool_names is None or definition["name"] in allowed_tool_names
+        ]
+        return [types.Tool(function_declarations=declarations)]
+
+    def _allowed_tool_names(
+        self,
+        *,
+        options_requested: bool,
+        portfolio_requested: bool,
+    ) -> set[str]:
+        names = {item["name"] for item in self.mcp_client.gemini_function_declarations()}
+        if not options_requested:
+            names.discard("yfinance_risk_lookup")
+        if not portfolio_requested:
+            names.discard("portfolio_holdings")
+        return names
+
+    @staticmethod
+    def _options_requested(goal: str) -> bool:
+        normalized = goal.lower()
+        return any(term in normalized for term in ("option", "volatility", "implied", "hedge", "derivative", "trade"))
+
+    @staticmethod
+    def _portfolio_requested(goal: str) -> bool:
+        normalized = goal.lower()
+        return any(term in normalized for term in ("portfolio", "holdings", "positions", "allocation", "exposure"))
+
+    def _generate_structured_synthesis(
+        self,
+        contents: list[dict[str, Any]],
+    ) -> GeminiRiskSynthesis:
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[
+                *contents,
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                f"{self.FINAL_SYNTHESIS_INSTRUCTION} Do not discuss or synthesize a "
+                                "different asset from prior Slack context."
+                            )
+                        }
+                    ],
+                },
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=self.SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_json_schema=GeminiRiskSynthesis.model_json_schema(),
+                temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.15")),
+                top_p=float(os.getenv("GEMINI_TOP_P", "0.8")),
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        try:
+            if isinstance(parsed, GeminiRiskSynthesis):
+                return parsed
+            if parsed is not None:
+                return GeminiRiskSynthesis.model_validate(parsed)
+            return GeminiRiskSynthesis.model_validate_json(response.text or "")
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Gemini synthesis failed Pydantic validation: {exc}") from exc
+
+    @staticmethod
+    def _model_content(response: Any, fallback_call_id: str | None = None) -> dict[str, Any]:
+        candidates = list(getattr(response, "candidates", None) or [])
+        if candidates and getattr(candidates[0], "content", None) is not None:
+            content = candidates[0].content
+            if hasattr(content, "model_dump"):
+                serialized = content.model_dump(mode="json", exclude_none=True)
+                if fallback_call_id:
+                    for part in serialized.get("parts", []):
+                        function_call = part.get("function_call")
+                        if function_call is not None and not function_call.get("id"):
+                            function_call["id"] = fallback_call_id
+                return serialized
+
+        function_calls = list(getattr(response, "function_calls", None) or [])
+        if function_calls:
+            function_call = function_calls[0]
+            return {
+                "role": "model",
+                "parts": [
+                    {
+                        "function_call": {
+                            "id": function_call.id or fallback_call_id,
+                            "name": function_call.name,
+                            "args": dict(function_call.args or {}),
+                        }
+                    }
+                ],
+            }
+        return {"role": "model", "parts": [{"text": response.text or ""}]}
+
+    @staticmethod
+    def _function_response_content(
+        tool_call_id: str,
+        execution: MCPToolExecution,
+    ) -> dict[str, Any]:
+        return {
+            "role": "tool",
+            "parts": [
+                {
+                    "function_response": {
+                        "id": tool_call_id,
+                        "name": execution.tool_name,
+                        "response": {
+                            "output": execution.output[:20_000],
+                            "is_error": execution.is_error,
+                        },
+                    }
+                }
+            ],
+        }
 
 
 class AlphaChannelRouter:
@@ -188,13 +742,13 @@ class AlphaChannelRouter:
         yfinance_node: YahooFinanceOptionsWorker | None = None,
         trading_node: TradingNode | None = None,
         mcp_client: AlphaChannelMCPClient | None = None,
-        agent_brain: QwenAgentBrain | None = None,
+        agent_brain: Any | None = None,
     ) -> None:
         self.sec_node = sec_node or SecRiskExtractor()
         self.yfinance_node = yfinance_node or YahooFinanceOptionsWorker()
         self.trading_node = trading_node or TradingNode()
         self.mcp_client = mcp_client or AlphaChannelMCPClient()
-        self.agent_brain = agent_brain or QwenAgentBrain(self.mcp_client)
+        self.agent_brain = agent_brain or GeminiOrchestrationBrain(self.mcp_client)
         self._conversation_lock = threading.RLock()
         self._conversations: dict[str, list[ConversationTurn]] = {}
         self._pending_actions: dict[str, PendingToolAction] = {}
@@ -233,6 +787,10 @@ class AlphaChannelRouter:
                 pending_action=pending_for_thread,
                 conversation_turn_count=turn_count,
             )
+
+        direct_trade = self._extract_direct_trade_intent(request.text)
+        if direct_trade is not None:
+            return self._create_direct_trade_checkpoint(request, direct_trade, key)
 
         conversation = [
             {
@@ -276,6 +834,144 @@ class AlphaChannelRouter:
             conversation_turn_count=turn_count,
         )
 
+    def _create_direct_trade_checkpoint(
+        self,
+        request: AgentTurnRequest,
+        intent: DirectTradeIntent,
+        conversation_key: str,
+    ) -> AgentTurnResponse:
+        with self._conversation_lock:
+            for existing in reversed(self._pending_actions.values()):
+                if (
+                    existing.channel_id == request.channel_id
+                    and existing.thread_ts == request.thread_ts
+                    and existing.tool_name == "execute_trade_checkpoint"
+                    and existing.status in {"pending", "edited"}
+                ):
+                    message = (
+                        f"A trade checkpoint is already pending for *{existing.arguments.get('ticker', 'the requested asset')}*. "
+                        "Approve, deny, or edit that checkpoint before creating another sell request."
+                    )
+                    turns = self._conversations[conversation_key]
+                    turns.append(ConversationTurn(role="assistant", content=message))
+                    logger.info(
+                        "duplicate_trade_checkpoint_ignored",
+                        extra={"action_id": existing.action_id, "ticker": existing.arguments.get("ticker")},
+                    )
+                    return AgentTurnResponse(
+                        channel_id=request.channel_id,
+                        thread_ts=request.thread_ts,
+                        message=message,
+                        pending_action=existing.model_copy(deep=True),
+                        conversation_turn_count=len(turns),
+                    )
+
+        if intent.notional_usd is None:
+            message = (
+                f"Trade intent detected for *{intent.side.upper()} {intent.ticker}*, but no dollar amount was provided. "
+                "Specify a notional amount, for example `Buy $500 of NOW`. No market-data lookup was run."
+            )
+            with self._conversation_lock:
+                turns = self._conversations[conversation_key]
+                turns.append(ConversationTurn(role="assistant", content=message))
+                turn_count = len(turns)
+            return AgentTurnResponse(
+                channel_id=request.channel_id,
+                thread_ts=request.thread_ts,
+                message=message,
+                conversation_turn_count=turn_count,
+            )
+
+        pending = PendingToolAction(
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            requested_by=request.user_id,
+            tool_name="execute_trade_checkpoint",
+            arguments={
+                "ticker": intent.ticker,
+                "side": intent.side,
+                "notional_usd": intent.notional_usd,
+                "rationale": "Explicit user trade request; awaiting human approval before dry-run checkpoint execution.",
+            },
+        )
+        message = (
+            f"Trade request detected: *{intent.side.upper()} ${intent.notional_usd:,.2f} of {intent.ticker}*.\n\n"
+            "This request is routed directly to the human approval checkpoint. No risk analysis or market-data "
+            "lookup was triggered. Review the parameters before approving; this remains a dry-run action."
+        )
+        with self._conversation_lock:
+            self._pending_actions[pending.action_id] = pending
+            turns = self._conversations[conversation_key]
+            turns.append(ConversationTurn(role="assistant", content=message))
+            turn_count = len(turns)
+        logger.info(
+            "direct_trade_checkpoint_created",
+            extra={
+                "ticker": intent.ticker,
+                "side": intent.side,
+                "notional_usd": intent.notional_usd,
+                "action_id": pending.action_id,
+            },
+        )
+        return AgentTurnResponse(
+            channel_id=request.channel_id,
+            thread_ts=request.thread_ts,
+            message=message,
+            pending_action=pending,
+            conversation_turn_count=turn_count,
+        )
+
+    @classmethod
+    def _extract_direct_trade_intent(cls, text: str) -> DirectTradeIntent | None:
+        normalized = text.strip()
+        lowered = normalized.lower()
+        side: Literal["buy", "sell", "hedge"] | None = None
+        if re.search(r"\b(buy|purchase|acquire)\b", lowered):
+            side = "buy"
+        elif re.search(r"\b(sell|liquidate|reduce)\b", lowered):
+            side = "sell"
+        elif re.search(r"\b(hedge|protect)\b", lowered):
+            side = "hedge"
+        if side is None:
+            return None
+
+        aliases = {
+            "service now": "NOW",
+            "servicenow": "NOW",
+            "snowflake": "SNOW",
+            "nu holdings": "NU",
+            "nubank": "NU",
+            "amazon": "AMZN",
+            "meta platforms": "META",
+            "facebook": "META",
+        }
+        ticker: str | None = None
+        for company_name, symbol in aliases.items():
+            if re.search(rf"\b{re.escape(company_name)}\b", lowered):
+                ticker = symbol
+                break
+        if ticker is None:
+            ignored = {"BUY", "SELL", "PURCHASE", "ACQUIRE", "OF", "THE", "STOCK", "SHARES", "USD"}
+            candidates = re.findall(r"\$?\b[A-Za-z]{1,5}\b", normalized)
+            for candidate in candidates:
+                symbol = candidate.upper().lstrip("$")
+                if symbol not in ignored:
+                    ticker = symbol
+                    break
+        if ticker is None:
+            return None
+
+        amount_match = re.search(
+            r"(?:\$\s*|\b(?:usd|dollars?)\s*)([0-9][0-9,]*(?:\.[0-9]{1,2})?)|\b([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:usd|dollars?)\b",
+            lowered,
+        )
+        amount = None
+        if amount_match:
+            raw_amount = next((group for group in amount_match.groups() if group), None)
+            if raw_amount:
+                amount = float(raw_amount.replace(",", ""))
+        return DirectTradeIntent(ticker=ticker, side=side, notional_usd=amount)
+
     def approve_agent_action(self, action_id: str, decided_by: str) -> AgentTurnResponse:
         with self._conversation_lock:
             pending = self._require_pending_action(action_id)
@@ -288,8 +984,43 @@ class AlphaChannelRouter:
                 pending.status = "pending"
             raise
 
+        if pending.tool_name == "execute_trade_checkpoint" and not pending.tool_call_id:
+            try:
+                portfolio_update = self.trading_node.apply_dry_run_trade(
+                    ticker=str(pending.arguments["ticker"]),
+                    side=str(pending.arguments["side"]),
+                    notional_usd=float(pending.arguments["notional_usd"]),
+                )
+            except Exception:
+                with self._conversation_lock:
+                    pending.status = "pending"
+                raise
+            with self._conversation_lock:
+                pending.status = "executed"
+                key = self._conversation_key(pending.channel_id, pending.thread_ts)
+                turns = self._conversations.setdefault(key, [])
+                message = (
+                    f"Approved by <@{decided_by}>.\n\n"
+                    f"`{pending.arguments['side'].upper()} ${float(pending.arguments['notional_usd']):,.2f} "
+                    f"{pending.arguments['ticker']}` dry-run checkpoint recorded. No live trade was executed.\n\n"
+                    f"Paper portfolio updated: `{portfolio_update.get('shares_changed', 0):.4g}` shares "
+                    f"affected; buying power is now `${float(portfolio_update['cash_balance']):,.2f}`.\n\n"
+                    "*Brokerage integration note:* Robinhood, Webull, or another trading platform can be connected "
+                    "through its official API or MCP server, subject to separately governed credentials and explicit approval."
+                )
+                turns.append(ConversationTurn(role="tool", content=f"{execution.tool_name}: {execution.output}"))
+                turns.append(ConversationTurn(role="assistant", content=message))
+                turn_count = len(turns)
+            return AgentTurnResponse(
+                channel_id=pending.channel_id,
+                thread_ts=pending.thread_ts,
+                message=message,
+                tool_executions=[execution],
+                conversation_turn_count=turn_count,
+            )
+
         if not pending.tool_call_id or not pending.continuation_messages:
-            raise RuntimeError("Pending MCP action does not contain a resumable Qwen continuation.")
+            raise RuntimeError("Pending MCP action does not contain a resumable Gemini continuation.")
         try:
             brain_result = self.agent_brain.resume(
                 continuation_messages=pending.continuation_messages,
@@ -354,6 +1085,10 @@ class AlphaChannelRouter:
                     for tool_call in message.get("tool_calls", []):
                         if tool_call.get("id") == pending.tool_call_id:
                             tool_call["function"]["arguments"] = json.dumps(arguments)
+                    for part in message.get("parts", []):
+                        function_call = part.get("function_call")
+                        if function_call and function_call.get("id") == pending.tool_call_id:
+                            function_call["args"] = arguments
             key = self._conversation_key(pending.channel_id, pending.thread_ts)
             self._conversations.setdefault(key, []).append(
                 ConversationTurn(
@@ -389,7 +1124,7 @@ class AlphaChannelRouter:
     def _pending_action_from_brain(
         self,
         request: AgentTurnRequest,
-        result: BrainRunResult,
+        result: BrainRunResult | GeminiBrainRunResult,
     ) -> PendingToolAction | None:
         if not result.pending_tool_name:
             return None
@@ -453,11 +1188,12 @@ class AlphaChannelRouter:
     ) -> dict[str, Any]:
         return self.trading_node.record_checkpoint(payload=payload, decision=decision, decided_by=decided_by)
 
-    def generate_portfolio_dashboard(self) -> list[dict[str, Any]]:
-        holdings = self.trading_node.get_portfolio_holdings()
-        logger.info("portfolio_dashboard_requested", extra={"holding_count": len(holdings)})
+    def generate_portfolio_dashboard(self, *, refresh_market_data: bool = False) -> list[dict[str, Any]]:
+        snapshot = self.trading_node.get_portfolio_snapshot(refresh_market_data=refresh_market_data)
+        alert_report = self.trading_node.evaluate_portfolio_alerts(snapshot)
+        logger.info("portfolio_dashboard_requested", extra={"holding_count": len(snapshot.holdings)})
 
-        blocks: list[dict[str, Any]] = [
+        return_blocks: list[dict[str, Any]] = [
             {
                 "type": "header",
                 "text": {"type": "plain_text", "text": "Portfolio Center", "emoji": True},
@@ -466,23 +1202,76 @@ class AlphaChannelRouter:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*Institutional Holdings Snapshot*\nReview exposure status and route assets for audit or trim logic.",
+                    "text": (
+                        f"*{snapshot.portfolio_name}*  |  Stocks only  |  Cash account  |  "
+                        f"Price source: *{snapshot.market_data_source}*  |  Approval-gated actions"
+                    ),
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*Cash / Buying Power:* ${snapshot.cash_balance:,.2f}  |  "
+                        f"*Invested in Stocks:* ${snapshot.total_cost_basis:,.2f}  |  "
+                        f"*Portfolio Equity:* ${snapshot.total_portfolio_equity:,.2f}  |  "
+                        f"*Total Return:* ${snapshot.total_return_dollars:+,.2f}  |  "
+                        f"*Return:* {snapshot.total_return_percent:+.2f}%"
+                    ),
                 },
             },
             {"type": "divider"},
         ]
+        triggers = alert_report.get("triggers", [])
+        if triggers:
+            alert_lines = ["*Portfolio Alerts*"]
+            for trigger in triggers[:8]:
+                severity = str(trigger.get("severity", "LOW"))
+                icon = "🔴" if severity in {"CRITICAL", "HIGH"} else "🟡"
+                target = trigger.get("ticker") or trigger.get("sector") or "Portfolio"
+                alert_lines.append(
+                    f"{icon} *{target}* · {trigger.get('type', 'risk alert')} · "
+                    f"{trigger.get('recommendation', trigger.get('reason', 'Review exposure.'))}"
+                )
+            return_blocks.extend(
+                [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(alert_lines)}},
+                    {"type": "divider"},
+                ]
+            )
+        else:
+            return_blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "✅ Risk checks clear · stop-loss −20% · take-profit +50% · stock 15% · sector 30%",
+                        }
+                    ],
+                }
+            )
 
-        for holding in holdings:
-            ticker = holding["Ticker"]
-            blocks.extend(
+        for holding in snapshot.holdings:
+            ticker = holding.ticker
+            return_blocks.extend(
                 [
                     {
                         "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*Ticker*\n{ticker}"},
-                            {"type": "mrkdwn", "text": f"*Allocation*\n{holding['Allocation']}"},
-                            {"type": "mrkdwn", "text": f"*Status*\n{holding['Status']}"},
-                        ],
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*{ticker} · {holding.company_name}*  |  "
+                                f"*Shares:* {holding.shares_held:g}  |  "
+                                f"*Avg:* ${holding.average_buy_price:,.2f}  |  "
+                                f"*Now:* ${holding.current_market_price:,.2f}  |  "
+                                f"*Cost:* ${holding.total_cost_basis:,.2f}  |  "
+                                f"*Value:* ${holding.current_market_value:,.2f}  |  "
+                                f"*P&L:* {'🟢' if holding.unrealized_pnl_percent >= 0 else '🔴'} "
+                                f"{holding.unrealized_pnl_percent:+.2f}%"
+                            ),
+                        },
                     },
                     {
                         "type": "actions",
@@ -497,7 +1286,7 @@ class AlphaChannelRouter:
                             {
                                 "type": "button",
                                 "action_id": "portfolio_trim_allocation",
-                                "text": {"type": "plain_text", "text": "⚡ Trim", "emoji": True},
+                                "text": {"type": "plain_text", "text": "⚡ Sell / Trim", "emoji": True},
                                 "value": f"TRIM_{ticker}",
                             },
                         ],
@@ -506,7 +1295,7 @@ class AlphaChannelRouter:
                 ]
             )
 
-        return blocks
+        return return_blocks
 
     def _build_graph(self) -> Any | None:
         try:

@@ -8,7 +8,7 @@ import threading
 import time
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Literal
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, Field
@@ -61,7 +61,12 @@ class SecEdgarClient:
     _filing_cache: ClassVar[dict[tuple[str, tuple[str, ...]], SecFilingDocument]] = {}
     _last_request_at: ClassVar[float] = 0.0
 
-    def __init__(self, user_agent: str | None = None, timeout_seconds: float = 20.0) -> None:
+    def __init__(
+        self,
+        user_agent: str | None = None,
+        timeout_seconds: float = 20.0,
+        backend: Literal["edgartools", "raw"] | None = None,
+    ) -> None:
         self.user_agent = (
             user_agent
             or os.getenv("SEC_EDGAR_USER_AGENT")
@@ -69,6 +74,12 @@ class SecEdgarClient:
             or ""
         ).strip()
         self.timeout_seconds = timeout_seconds
+        self.backend: Literal["edgartools", "raw"] = (
+            backend
+            or os.getenv("SEC_EDGAR_BACKEND", "edgartools").strip().lower()
+        )  # type: ignore[assignment]
+        if self.backend not in {"edgartools", "raw"}:
+            raise ValueError("SEC_EDGAR_BACKEND must be 'edgartools' or 'raw'.")
 
     def fetch_latest_filing(
         self,
@@ -77,7 +88,8 @@ class SecEdgarClient:
     ) -> SecFilingDocument:
         if not self.user_agent:
             raise RuntimeError(
-                "SEC_EDGAR_USER_AGENT is required. Set it to 'Organization contact@example.com' for SEC fair access."
+                "SEC EDGAR identity is required. Set EDGAR_IDENTITY='Organization contact@example.com' "
+                "in .env for EdgarTools fair access (SEC_EDGAR_USER_AGENT is supported for legacy raw mode)."
             )
         normalized_ticker = ticker.strip().upper()
         cache_key = (normalized_ticker, forms)
@@ -92,6 +104,83 @@ class SecEdgarClient:
                 )
                 return cached.model_copy(deep=True)
 
+        if self.backend == "edgartools":
+            try:
+                document = self._fetch_with_edgartools(normalized_ticker, forms)
+            except Exception as exc:
+                logger.warning(
+                    "edgartools_fetch_failed_falling_back_to_raw",
+                    extra={"ticker": normalized_ticker, "error": str(exc)},
+                )
+                document = self._fetch_with_raw_client(normalized_ticker, forms)
+        else:
+            document = self._fetch_with_raw_client(normalized_ticker, forms)
+
+        with self._lock:
+            self._filing_cache[cache_key] = document
+        logger.info(
+            "sec_edgar_filing_fetched ticker=%s form=%s filing_date=%s text_chars=%d backend=%s",
+            document.ticker,
+            document.form,
+            document.filing_date,
+            len(document.text),
+            self.backend,
+        )
+        return document.model_copy(deep=True)
+
+    def _fetch_with_edgartools(
+        self, ticker: str, forms: tuple[str, ...]
+    ) -> SecFilingDocument:
+        """Retrieve and normalize a filing through EdgarTools' maintained API."""
+        # Keep EdgarTools' cache out of an unwritable user profile on managed hosts.
+        os.environ.setdefault(
+            "EDGAR_LOCAL_DATA_DIR",
+            str(Path(__file__).resolve().parents[1] / ".edgar-data"),
+        )
+        # EdgarTools reads this canonical variable independently of our legacy alias.
+        os.environ.setdefault("EDGAR_IDENTITY", self.user_agent)
+        from edgar import Company
+
+        company = Company(ticker)
+        filing = company.get_filings(form=list(forms), amendments=False).latest()
+        if filing is None:
+            raise RuntimeError(f"EdgarTools returned no recent filing for {ticker}.")
+        filing_text = str(filing.text()).strip()
+        if len(filing_text) < 1000:
+            raise RuntimeError(f"SEC filing text extraction produced insufficient content for {ticker}.")
+
+        primary_document = ""
+        try:
+            primary = filing.document
+            primary_document = str(
+                getattr(primary, "name", None)
+                or getattr(primary, "filename", None)
+                or getattr(primary, "document", None)
+                or ""
+            )
+        except Exception:
+            logger.debug("edgartools_primary_document_unavailable", extra={"ticker": ticker})
+
+        accession_number = str(
+            getattr(filing, "accession_number", None)
+            or getattr(filing, "accession_no", "")
+        )
+        cik = str(getattr(filing, "cik", "")).zfill(10)
+        return SecFilingDocument(
+            ticker=ticker,
+            company_name=str(getattr(filing, "company", ticker)),
+            cik=cik,
+            form=str(getattr(filing, "form", "")),
+            filing_date=str(getattr(filing, "filing_date", "")),
+            accession_number=accession_number,
+            primary_document=primary_document,
+            filing_url=str(getattr(filing, "url", getattr(filing, "homepage_url", ""))),
+            text=filing_text,
+        )
+
+    def _fetch_with_raw_client(
+        self, normalized_ticker: str, forms: tuple[str, ...]
+    ) -> SecFilingDocument:
         company = self._resolve_company(normalized_ticker)
         cik_padded = str(company["cik_str"]).zfill(10)
         submissions = self._get_json(self.SUBMISSIONS_URL.format(cik=cik_padded))
@@ -127,16 +216,7 @@ class SecEdgarClient:
             filing_url=filing_url,
             text=filing_text,
         )
-        with self._lock:
-            self._filing_cache[cache_key] = document
-        logger.info(
-            "sec_edgar_filing_fetched ticker=%s form=%s filing_date=%s text_chars=%d",
-            document.ticker,
-            document.form,
-            document.filing_date,
-            len(document.text),
-        )
-        return document.model_copy(deep=True)
+        return document
 
     def _resolve_company(self, ticker: str) -> dict[str, Any]:
         with self._lock:

@@ -319,7 +319,11 @@ class PortfolioAnalyzer:
         elif concentration_risk["risk_level"] == "MEDIUM":
             positions = concentration_risk["concentrated_positions"]
             if positions:
-                rec = f"⚠️ Top 3 positions: {', '.join(f\"{p['ticker']} ({p['pct']:.1f}%)\" for p in positions[:3])}. Consider rebalancing."
+                top_positions = ", ".join(
+                    f"{position['ticker']} ({position['pct']:.1f}%)"
+                    for position in positions[:3]
+                )
+                rec = f"⚠️ Top 3 positions: {top_positions}. Consider rebalancing."
                 recommendations.append(rec)
         
         # Sector bias recommendations

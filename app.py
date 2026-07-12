@@ -52,6 +52,7 @@ if not (os.getenv("SEC_EDGAR_USER_AGENT") or os.getenv("EDGAR_IDENTITY")):
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 slack_app = App(token=SLACK_BOT_TOKEN)
 router = AlphaChannelRouter()
+router.mcp_client.warmup_async()
 
 def _extract_action_token(body: dict[str, Any], context: dict[str, Any] | None = None) -> str | None:
     """Slack assistant surfaces can place action tokens in different envelopes."""
@@ -353,6 +354,28 @@ def _build_command_help_blocks() -> list[dict[str, Any]]:
     ]
 
 
+def _is_portfolio_dashboard_query(query: str) -> bool:
+    normalized = re.sub(r"\s+", " ", query.strip().lower())
+    monitoring_terms = (
+        "stop loss",
+        "stop-loss",
+        "take profit",
+        "profit alert",
+        "risk alert",
+        "concentration",
+        "overweight",
+        "position limit",
+        "sector exposure",
+        "rebalance",
+    )
+    return bool(
+        re.search(r"\b(portfolio|holdings|positions|dashboard)\b", normalized)
+        or re.search(r"\b(list|show)\s+(all\s+)?my\s+(portfolio\s+)?positions\b", normalized)
+        or re.search(r"\b(show|list)\s+(my\s+)?holdings\b", normalized)
+        or any(term in normalized for term in monitoring_terms)
+    )
+
+
 def _slack_code_block(text: str, limit: int = 2500) -> str:
     safe_text = str(text).replace("```", "'''")
     if len(safe_text) > limit:
@@ -413,7 +436,7 @@ def _build_agent_turn_blocks(response: AgentTurnResponse) -> list[dict[str, Any]
     if response.pending_action:
         return _build_pending_agent_action_blocks(response.pending_action, response.message)
 
-    finance_tools = {"yfinance_risk_lookup", "sec_risk_lookup", "portfolio_holdings"}
+    finance_tools = {"yfinance_risk_lookup", "yfinance_fundamental_lookup", "sec_risk_lookup", "portfolio_holdings"}
     header = (
         "AlphaChannel Risk Synthesis"
         if any(execution.tool_name in finance_tools for execution in response.tool_executions)
@@ -426,13 +449,15 @@ def _build_agent_turn_blocks(response: AgentTurnResponse) -> list[dict[str, Any]
     for execution in response.tool_executions:
         status = "failed" if execution.is_error else "completed"
         evidence_text = _summarize_mcp_execution(execution)
+        ticker = execution.arguments.get("ticker") if isinstance(execution.arguments, dict) else None
+        tool_label = f"`{execution.tool_name}`" + (f" (`{ticker}`)" if ticker else "")
         blocks.extend(
             [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Tool:* `{execution.tool_name}` | *Status:* {status}\n{evidence_text}",
+                        "text": f"*Tool:* {tool_label} | *Status:* {status}\n{evidence_text}",
                     },
                 },
                 {"type": "divider"},
@@ -468,6 +493,24 @@ def _summarize_mcp_execution(execution: Any) -> str:
             f"Put/call OI: `{f'{put_call:.2f}' if isinstance(put_call, (int, float)) else 'n/a'}`"
             + (f"\n<{source}|Open Yahoo Finance options source>" if source else "")
         )
+    if execution.tool_name == "yfinance_fundamental_lookup":
+        source = payload.get("source_url")
+        def display_number(key: str, suffix: str = "") -> str:
+            value = payload.get(key)
+            if not isinstance(value, (int, float)):
+                return "n/a"
+            return f"{value:.1%}" if suffix == "%" else f"{value:.2f}{suffix}"
+        return (
+            f"Price: `{payload.get('current_price', 'n/a')}` | "
+            f"Trailing P/E: `{display_number('trailing_pe')}` | "
+            f"Forward P/E: `{display_number('forward_pe')}`\n"
+            f"Revenue: `{payload.get('revenue', 'n/a')}` | "
+            f"Revenue growth: `{display_number('revenue_growth', '%')}` | "
+            f"Earnings growth: `{display_number('earnings_growth', '%')}` | "
+            f"ROE: `{display_number('return_on_equity', '%')}` | "
+            f"Debt/equity: `{display_number('debt_to_equity')}`"
+            + (f"\n<{source}|Open Yahoo Finance fundamentals source>" if source else "")
+        )
     if execution.tool_name == "sec_risk_lookup":
         markers = payload.get("risk_markers") or []
         source = payload.get("filing_url")
@@ -490,7 +533,7 @@ def _start_agent_turn_worker(
     query: str,
     workspace_context: str | None,
 ) -> None:
-    initial = "⚙️ _Agent Orchestrator:_ Planning MCP tools and checking approval policy..."
+    initial = "◐ _AlphaChannel is thinking_ · Planning MCP tools and checking approval policy..."
     posted = client.chat_postMessage(
         channel=channel_id,
         thread_ts=thread_ts,
@@ -501,16 +544,43 @@ def _start_agent_turn_worker(
     if not isinstance(message_ts, str) or not message_ts:
         raise ValueError("Slack did not return a timestamp for the MCP planning message.")
 
-    def worker() -> None:
-        try:
-            def update_progress(status: str) -> None:
-                formatted = f"⚙️ _Agent Brain:_ {status}"
+    progress_lock = threading.RLock()
+    progress_state = {"status": "Planning the investigation and selecting evidence tools..."}
+    animation_stop = threading.Event()
+
+    def animate_progress() -> None:
+        frames = ("◐", "◓", "◑", "◒")
+        frame_index = 0
+        while not animation_stop.wait(1.6):
+            with progress_lock:
+                status = progress_state["status"]
+            animated = f"{frames[frame_index % len(frames)]} _AlphaChannel is thinking_ · {status}"
+            frame_index += 1
+            try:
                 client.chat_update(
                     channel=channel_id,
                     ts=message_ts,
-                    blocks=_mrkdwn_stream_blocks(formatted),
-                    text=status,
+                    blocks=_mrkdwn_stream_blocks(animated),
+                    text=f"AlphaChannel is thinking: {status}",
                 )
+            except SlackApiError as exc:
+                logger.warning(
+                    "agent_progress_animation_failed",
+                    extra={"channel_id": channel_id, "error": exc.response.get("error")},
+                )
+
+    animation_thread = threading.Thread(
+        target=animate_progress,
+        name=f"alpha-channel-progress-{channel_id}-{thread_ts}",
+        daemon=True,
+    )
+    animation_thread.start()
+
+    def worker() -> None:
+        try:
+            def update_progress(status: str) -> None:
+                with progress_lock:
+                    progress_state["status"] = status
 
             response = router.process_agent_turn(
                 AgentTurnRequest(
@@ -522,6 +592,8 @@ def _start_agent_turn_worker(
                 ),
                 progress_callback=update_progress,
             )
+            animation_stop.set()
+            animation_thread.join(timeout=2.0)
             client.chat_update(
                 channel=channel_id,
                 ts=message_ts,
@@ -529,6 +601,8 @@ def _start_agent_turn_worker(
                 text=_format_slack_mrkdwn(response.message),
             )
         except Exception as exc:
+            animation_stop.set()
+            animation_thread.join(timeout=2.0)
             logger.exception("agent_turn_worker_failed", extra={"channel_id": channel_id, "thread_ts": thread_ts})
             client.chat_update(
                 channel=channel_id,
@@ -540,6 +614,49 @@ def _start_agent_turn_worker(
     threading.Thread(
         target=worker,
         name=f"alpha-channel-agent-{channel_id}-{thread_ts}",
+        daemon=True,
+    ).start()
+
+
+def _start_portfolio_dashboard_worker(
+    *,
+    client: WebClient,
+    channel_id: str,
+    thread_ts: str,
+) -> None:
+    """Refresh portfolio prices off the Socket Mode event loop."""
+    initial_message = "◐ _Portfolio Center:_ Refreshing live market prices..."
+    posted = client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        blocks=_mrkdwn_stream_blocks(initial_message),
+        text="Portfolio Center refreshing live market prices",
+    )
+    message_ts = posted.get("ts")
+    if not isinstance(message_ts, str) or not message_ts:
+        raise ValueError("Slack did not return a timestamp for the portfolio refresh message.")
+
+    def worker() -> None:
+        try:
+            blocks = router.generate_portfolio_dashboard(refresh_market_data=True)
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_normalize_slack_blocks(blocks),
+                text="AlphaChannel Portfolio Center",
+            )
+        except Exception as exc:
+            logger.exception("portfolio_dashboard_refresh_failed", extra={"channel_id": channel_id})
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                blocks=_build_error_blocks(str(exc)),
+                text="Portfolio Center refresh failed",
+            )
+
+    threading.Thread(
+        target=worker,
+        name=f"alpha-channel-portfolio-{channel_id}-{thread_ts}",
         daemon=True,
     ).start()
 
@@ -569,6 +686,18 @@ def _process_slack_message(
                 thread_ts=thread_ts,
                 blocks=_build_command_help_blocks(),
                 text="AlphaChannel command help",
+            )
+            return
+
+        if _is_portfolio_dashboard_query(query):
+            logger.info(
+                "portfolio_dashboard_intent_matched",
+                extra={"channel_id": channel_id, "user_id": user_id},
+            )
+            _start_portfolio_dashboard_worker(
+                client=client,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
             )
             return
 
@@ -1165,37 +1294,51 @@ def portfolio_trim_allocation(ack: Any, body: dict[str, Any], client: WebClient)
         ticker = _ticker_from_prefixed_action_value(_raw_action_value(body), "TRIM")
         user_id = body.get("user", {}).get("id", "unknown")
         channel_id = _action_channel_id(body)
-        thread_ts = _action_thread_ts(body)
+        thread_ts = _action_thread_ts(body) or _action_message_ts(body)
+        snapshot = router.trading_node.get_portfolio_snapshot(refresh_market_data=True)
+        holding = next((item for item in snapshot.holdings if item.ticker == ticker), None)
+        if holding is None:
+            raise ValueError(f"No stock holding found for {ticker}.")
+        trim_notional = round(holding.current_market_value * 0.10, 2)
         logger.info(
-            "portfolio_trim_allocation_requested",
-            extra={"ticker": ticker, "user_id": user_id, "channel_id": channel_id},
+            "portfolio_trim_sell_checkpoint_requested",
+            extra={
+                "ticker": ticker,
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "notional_usd": trim_notional,
+                "trim_percent": 10,
+            },
         )
-        initial_message = "⚙️ _AlphaChannel Orchestrator:_ Initiating Trim Core..."
-        response = client.chat_postMessage(
+        response = router.process_agent_turn(
+            AgentTurnRequest(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                user_id=user_id,
+                text=f"Sell ${trim_notional:.2f} of {ticker}",
+            )
+        )
+        if response.pending_action is None:
+            raise RuntimeError("AlphaChannel did not create a sell approval checkpoint.")
+        if response.message.startswith("A trade checkpoint is already pending"):
+            logger.info(
+                "duplicate_portfolio_trim_ignored",
+                extra={"ticker": ticker, "channel_id": channel_id, "action_id": response.pending_action.action_id},
+            )
+            return
+        client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            blocks=_mrkdwn_stream_blocks(initial_message),
-            text=f"AlphaChannel Orchestrator initiating Trim Core for {ticker}",
-        )
-        message_ts = response.get("ts")
-        if not isinstance(message_ts, str) or not message_ts:
-            raise ValueError("Slack did not return a timestamp for the trim progress message.")
-        response_channel_id = response.get("channel") or channel_id
-        if not isinstance(response_channel_id, str) or not response_channel_id:
-            raise ValueError("Slack did not return a channel for the trim progress message.")
-
-        _start_portfolio_progress_worker(
-            client=client,
-            channel_id=response_channel_id,
-            message_ts=message_ts,
-            ticker=ticker,
-            action_name="portfolio_trim_allocation",
-            progress_steps=[
-                "⚡ _Trading Node:_ Calculating current portfolio delta and liquidity boundaries...",
-                "📝 _Compliance Node:_ Generating verified audit trail snapshot for governance review...",
-            ],
-            final_message=f"📉 *Order Complete:* Successfully queued position adjustment framework for {ticker}.",
-            final_blocks=_portfolio_trim_result_blocks(ticker),
+            blocks=_build_pending_agent_action_blocks(
+                response.pending_action,
+                (
+                    f"*Trim request converted to a sell checkpoint for {ticker}.*\n"
+                    f"Proposed trim: *10%* of the position, `${trim_notional:,.2f}` notional.\n"
+                    f"This represents approximately `{holding.shares_held * 0.10:.4g}` shares at the mock market price.\n\n"
+                    "Review the parameters before approval. This is still a dry-run action; no live order was submitted."
+                ),
+            ),
+            text=f"Sell checkpoint created for {ticker}",
         )
     except SlackApiError as exc:
         logger.exception(
