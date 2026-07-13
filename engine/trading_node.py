@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from engine.portfolio_store import PortfolioStore
 
-logger = logging.getLogger("alpha_channel.engine.trading")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.trading")
 
 DecisionType = Literal["approve_buy_allocation", "execute_protective_hedge", "reject", "defer"]
 
@@ -54,7 +54,7 @@ class PortfolioHolding(BaseModel):
 
 
 class PortfolioSnapshot(BaseModel):
-    """Mock Robinhood Agentic Account snapshot for the Slack Portfolio Center."""
+    """Paper Robinhood Agentic Account snapshot for the Slack Portfolio Center."""
 
     portfolio_name: str
     account_type: Literal["robinhood_agentic_account"] = "robinhood_agentic_account"
@@ -65,13 +65,13 @@ class PortfolioSnapshot(BaseModel):
     total_portfolio_equity: float = Field(ge=0)
     total_return_dollars: float
     total_return_percent: float
-    market_data_source: str = "Demo fallback prices"
+    market_data_source: str = "Stored reference prices"
     market_data_live: bool = False
     market_data_refreshed_at: datetime | None = None
 
 
-def build_mock_portfolio() -> PortfolioSnapshot:
-    """Build a deterministic, equities-only portfolio with derived account metrics."""
+def build_seed_portfolio() -> PortfolioSnapshot:
+    """Build the deterministic paper portfolio used to initialize account metrics."""
     cash_balance = 8_518.80
     positions = (
         ("NOW", "ServiceNow", "Software", 2.0, 104.10, 107.71),
@@ -164,9 +164,9 @@ class TradingNode:
             market_data_source=(
                 "Yahoo Finance MCP"
                 if live_count == len(positions)
-                else "Yahoo Finance MCP + demo fallback"
+                else "Yahoo Finance MCP + stored reference prices"
                 if live_count
-                else "Demo fallback prices"
+                else "Stored reference prices"
             ),
             market_data_live=live_count == len(positions) and bool(positions),
             market_data_refreshed_at=datetime.now(timezone.utc) if refresh_market_data else None,
@@ -185,30 +185,64 @@ class TradingNode:
         return snapshot
 
     def _fetch_live_prices(self, tickers: list[str]) -> dict[str, float]:
-        from engine.yfinance_node import YahooFinanceFundamentalsWorker
+        from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
 
-        timeout = float(os.getenv("PORTFOLIO_MARKET_DATA_TIMEOUT_SECONDS", "10"))
         prices: dict[str, float] = {}
+        finance_client = YahooFinanceMCPClient()
         with ThreadPoolExecutor(max_workers=min(3, max(1, len(tickers)))) as executor:
             futures = {
-                executor.submit(
-                    YahooFinanceFundamentalsWorker(timeout_seconds=timeout).fetch_fundamental_signal,
-                    ticker,
-                ): ticker
+                executor.submit(finance_client.get_stock_info, ticker): ticker
                 for ticker in tickers
             }
             for future in as_completed(futures):
                 ticker = futures[future]
                 try:
-                    signal = future.result()
-                    if signal.current_price is not None and signal.current_price > 0:
-                        prices[ticker] = signal.current_price
+                    price = self._extract_live_price(future.result())
+                    if price is None:
+                        raise ValueError("Yahoo Finance MCP response contained no recognized live price.")
+                    prices[ticker] = price
+                    logger.info(
+                        "portfolio_live_price_loaded",
+                        extra={"ticker": ticker, "current_market_price": price, "source": "Yahoo Finance MCP"},
+                    )
                 except Exception as exc:
                     logger.warning(
                         "portfolio_live_price_failed",
                         extra={"ticker": ticker, "error_type": type(exc).__name__, "error": str(exc)},
                     )
         return prices
+
+    @staticmethod
+    def _extract_live_price(payload: Any) -> float | None:
+        """Extract a positive quote from common Yahoo Finance MCP response envelopes."""
+        price_keys = (
+            "currentPrice",
+            "regularMarketPrice",
+            "current_price",
+            "regular_market_price",
+            "price",
+        )
+
+        def visit(value: Any, depth: int = 0) -> float | None:
+            if depth > 4 or not isinstance(value, dict):
+                return None
+            for key in price_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, dict):
+                    candidate = candidate.get("raw", candidate.get("value"))
+                try:
+                    price = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    return price
+            for nested in value.values():
+                result = visit(nested, depth + 1)
+                if result is not None:
+                    return result
+            return None
+
+        return visit(payload)
 
     def evaluate_portfolio_alerts(self, snapshot: PortfolioSnapshot) -> dict[str, Any]:
         """Run the portfolio monitoring skill against the current snapshot."""
@@ -251,10 +285,37 @@ class TradingNode:
         return report
 
     def apply_dry_run_trade(self, *, ticker: str, side: str, notional_usd: float) -> dict[str, Any]:
+        market_context: dict[str, Any] = {}
+        try:
+            from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
+
+            market_context = YahooFinanceMCPClient().get_stock_info(ticker)
+        except Exception as exc:
+            logger.warning(
+                "paper_trade_market_context_unavailable",
+                extra={"ticker": ticker, "side": side, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+
+        reference_price: float | None = None
+        for key in ("currentPrice", "regularMarketPrice", "price"):
+            try:
+                candidate = float(market_context[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if candidate > 0:
+                reference_price = candidate
+                break
         result = self.portfolio_store.apply_dry_run_trade(
             ticker=ticker,
             side=side,
             notional_usd=notional_usd,
+            reference_price=reference_price,
+            company_name=str(
+                market_context.get("longName")
+                or market_context.get("shortName")
+                or ticker.upper()
+            ),
+            sector=str(market_context.get("sector") or "Unknown"),
         )
         logger.info("paper_portfolio_updated", extra=result)
         return result
@@ -309,7 +370,7 @@ class TradingNode:
 
         return [
             TargetMitigationOrder(
-                order_type="defer_to_investment_committee",
+                order_type="defer_to_governance_review",
                 ticker=ticker,
                 rationale="Signals are mixed; route to governance review instead of automatic execution.",
                 parameters={"requires_human_approval": True},

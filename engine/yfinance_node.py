@@ -1,3 +1,5 @@
+"""Yahoo Finance MCP normalization for AlphaChannel's 2026 Slack Hackathon agent."""
+
 from __future__ import annotations
 
 import logging
@@ -5,12 +7,11 @@ import os
 import queue
 import threading
 import time
-from statistics import mean
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger("alpha_channel.engine.yfinance")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.yahoo_finance_mcp")
 
 
 class OptionsRiskMarker(BaseModel):
@@ -114,28 +115,72 @@ class YahooFinanceFundamentalsWorker:
 
     @staticmethod
     def _fetch_info(ticker: str) -> dict[str, Any]:
-        """Use Yahoo Finance MCP, with direct yfinance as a compatibility fallback."""
-        mcp_enabled = os.getenv("YAHOO_FINANCE_MCP_ENABLED", "true").strip().lower()
-        if mcp_enabled not in {"0", "false", "no"}:
-            try:
-                from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
+        """Fetch fundamentals exclusively through the Yahoo Finance MCP server."""
+        try:
+            from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
 
-                info = YahooFinanceMCPClient().get_stock_info(ticker)
-                if isinstance(info, dict) and info:
-                    logger.info("yahoo_finance_mcp_fundamentals_fetched ticker=%s", ticker)
-                    return info
-                logger.warning("yahoo_finance_mcp_empty_response ticker=%s", ticker)
-            except Exception as exc:
-                logger.warning(
-                    "yahoo_finance_mcp_fallback_to_direct ticker=%s error_type=%s error=%s",
-                    ticker,
-                    type(exc).__name__,
-                    exc,
+            info = YahooFinanceMCPClient().get_stock_info(ticker)
+            if isinstance(info, dict) and info:
+                normalized = YahooFinanceFundamentalsWorker._normalize_info(info)
+                if YahooFinanceFundamentalsWorker._has_fundamental_data(normalized):
+                    logger.info(
+                        "yahoo_finance_mcp_fundamentals_fetched ticker=%s keys=%s",
+                        ticker,
+                        sorted(normalized.keys()),
+                    )
+                    return normalized
+                raise RuntimeError(
+                    "Yahoo Finance MCP returned no recognized fundamental metrics "
+                    f"for {ticker}; response keys={sorted(info.keys())}"
                 )
+            raise RuntimeError("Yahoo Finance MCP returned an empty response.")
+        except Exception as exc:
+            logger.error(
+                "yahoo_finance_mcp_fundamentals_unavailable ticker=%s error_type=%s error=%s",
+                ticker,
+                type(exc).__name__,
+                exc,
+            )
+            raise RuntimeError(f"Yahoo Finance MCP is unavailable for {ticker}.") from exc
 
-        import yfinance as yf
+    @staticmethod
+    def _normalize_info(info: dict[str, Any]) -> dict[str, Any]:
+        """Translate common MCP field names into AlphaChannel's financial-info contract."""
+        aliases = {
+            "price": "currentPrice",
+            "current_price": "currentPrice",
+            "regular_market_price": "regularMarketPrice",
+            "market_cap": "marketCap",
+            "revenue": "totalRevenue",
+            "total_revenue": "totalRevenue",
+            "revenue_growth": "revenueGrowth",
+            "earnings_growth": "earningsGrowth",
+            "trailing_pe": "trailingPE",
+            "forward_pe": "forwardPE",
+            "profit_margin": "profitMargins",
+            "return_on_equity": "returnOnEquity",
+            "debt_to_equity": "debtToEquity",
+        }
+        normalized = dict(info)
+        for source, target in aliases.items():
+            if target not in normalized and info.get(source) is not None:
+                normalized[target] = info[source]
+        return normalized
 
-        return dict(yf.Ticker(ticker).info or {})
+    @staticmethod
+    def _has_fundamental_data(info: dict[str, Any]) -> bool:
+        return any(
+            info.get(key) is not None
+            for key in (
+                "currentPrice",
+                "regularMarketPrice",
+                "trailingPE",
+                "forwardPE",
+                "totalRevenue",
+                "revenueGrowth",
+                "earningsGrowth",
+            )
+        )
 
     @staticmethod
     def _build_signal(ticker: str, info: dict[str, Any]) -> FundamentalSignal:
@@ -161,9 +206,14 @@ class YahooFinanceFundamentalsWorker:
             profit_margin=number("profitMargins"),
             return_on_equity=number("returnOnEquity"),
             debt_to_equity=number("debtToEquity"),
-            raw_metadata={"feed_status": "ok", "business_summary": info.get("longBusinessSummary", "")[:800]},
+            raw_metadata={
+                "feed_status": "ok" if YahooFinanceFundamentalsWorker._has_fundamental_data(info) else "partial",
+                "business_summary": str(info.get("longBusinessSummary", ""))[:800],
+            },
         )
         markers: list[str] = []
+        if not YahooFinanceFundamentalsWorker._has_fundamental_data(info):
+            markers.append("Yahoo Finance returned no usable fundamental metrics for this ticker.")
         if signal.trailing_pe is not None and signal.trailing_pe > 60:
             markers.append(f"Trailing P/E is elevated at {signal.trailing_pe:.1f}.")
         if signal.forward_pe is not None and signal.trailing_pe and signal.forward_pe < signal.trailing_pe:
@@ -242,15 +292,22 @@ class YahooFinanceOptionsWorker:
 
     def _fetch_live_options_signal(self, ticker: str) -> OptionsSignal:
         try:
-            import yfinance as yf
-        except ImportError as exc:
-            raise RuntimeError("yfinance is required for options market reality checks.") from exc
+            from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
 
-        try:
-            yf_ticker = yf.Ticker(ticker)
-            current_price = self._resolve_current_price(yf_ticker)
-            expiries = list(yf_ticker.options or [])
-            if not expiries:
+            info = YahooFinanceMCPClient().get_stock_info(ticker)
+            if not isinstance(info, dict) or not info:
+                raise RuntimeError("Yahoo Finance MCP returned an empty response.")
+
+            current_price = self._number(info, "currentPrice", "regularMarketPrice", "price", "current_price")
+            expiry = str(info.get("nearestExpiry") or info.get("nearest_expiry") or "")
+            front_month_iv = self._number(info, "frontMonthIV", "front_month_iv", "impliedVolatility")
+            put_call_ratio = self._number(
+                info,
+                "putCallOpenInterestRatio",
+                "put_call_open_interest_ratio",
+                "putCallRatio",
+            )
+            if front_month_iv is None and put_call_ratio is None and not expiry:
                 return OptionsSignal(
                     ticker=ticker,
                     current_price=current_price,
@@ -263,21 +320,13 @@ class YahooFinanceOptionsWorker:
                     ],
                 )
 
-            nearest_expiry = expiries[0]
-            chain = yf_ticker.option_chain(nearest_expiry)
-            call_iv = self._safe_mean(chain.calls.get("impliedVolatility", []))
-            put_iv = self._safe_mean(chain.puts.get("impliedVolatility", []))
-            front_month_iv = self._safe_mean([value for value in [call_iv, put_iv] if value is not None])
-            call_oi = float(chain.calls.get("openInterest", []).fillna(0).sum())
-            put_oi = float(chain.puts.get("openInterest", []).fillna(0).sum())
-            put_call_ratio = put_oi / call_oi if call_oi else None
-            markers = self._derive_markers(front_month_iv, put_call_ratio, nearest_expiry)
+            markers = self._derive_markers(front_month_iv, put_call_ratio, expiry)
 
             logger.info(
                 "yfinance_signal_fetched",
                 extra={
                     "ticker": ticker,
-                    "nearest_expiry": nearest_expiry,
+                    "nearest_expiry": expiry or None,
                     "front_month_iv": front_month_iv,
                     "put_call_open_interest_ratio": put_call_ratio,
                     "marker_count": len(markers),
@@ -286,15 +335,26 @@ class YahooFinanceOptionsWorker:
             return OptionsSignal(
                 ticker=ticker,
                 current_price=current_price,
-                nearest_expiry=nearest_expiry,
+                nearest_expiry=expiry or None,
                 front_month_iv=front_month_iv,
                 put_call_open_interest_ratio=put_call_ratio,
                 risk_markers=markers,
-                raw_metadata={"call_open_interest": call_oi, "put_open_interest": put_oi},
+                raw_metadata={"source": "yahoo-finance-mcp", "mcp_keys": sorted(info.keys())},
             )
         except Exception as exc:
             logger.exception("yfinance_signal_failed", extra={"ticker": ticker})
             return self._unavailable_signal(ticker, str(exc))
+
+    @staticmethod
+    def _number(info: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            value = info.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     @staticmethod
     def _unavailable_signal(ticker: str, reason: str) -> OptionsSignal:
@@ -309,30 +369,6 @@ class YahooFinanceOptionsWorker:
             ],
             raw_metadata={"feed_status": "unavailable", "reason": reason},
         )
-
-    @staticmethod
-    def _resolve_current_price(yf_ticker: Any) -> float | None:
-        fast_info = getattr(yf_ticker, "fast_info", None)
-        if fast_info:
-            for key in ("last_price", "lastPrice", "regular_market_price"):
-                try:
-                    value = fast_info.get(key)
-                except AttributeError:
-                    value = getattr(fast_info, key, None)
-                if value:
-                    return float(value)
-
-        history = yf_ticker.history(period="5d")
-        if history.empty:
-            return None
-        return float(history["Close"].dropna().iloc[-1])
-
-    @staticmethod
-    def _safe_mean(values: Any) -> float | None:
-        clean_values = [float(value) for value in values if value is not None and float(value) > 0]
-        if not clean_values:
-            return None
-        return float(mean(clean_values))
 
     @staticmethod
     def _derive_markers(

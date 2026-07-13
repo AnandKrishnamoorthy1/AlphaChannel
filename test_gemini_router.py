@@ -5,7 +5,14 @@ from typing import Any
 
 from google.genai import types
 
-from engine.core_router import AgentTurnRequest, AlphaChannelRouter, AssetResolution, GeminiOrchestrationBrain, GeminiRiskSynthesis
+from engine.core_router import (
+    AgentTurnRequest,
+    AlphaChannelRouter,
+    AssetResolution,
+    GeminiOrchestrationBrain,
+    GeminiRiskSynthesis,
+    IntentResolution,
+)
 from engine.mcp_client import MCPToolExecution, MCPToolPolicy
 
 
@@ -243,3 +250,35 @@ def test_duplicate_trade_request_reuses_existing_checkpoint() -> None:
     assert second.pending_action is not None
     assert second.pending_action.action_id == first.pending_action.action_id
     assert len(router._pending_actions) == 1
+
+
+def test_investment_question_containing_buy_is_not_a_trade_request() -> None:
+    assert AlphaChannelRouter._extract_direct_trade_intent(
+        "Check if ServiceNow is a buy right now"
+    ) is None
+
+
+def test_gemini_structured_intent_classifier_preserves_analysis_intent() -> None:
+    models = FakeModels(
+        [
+            SimpleNamespace(
+                parsed=IntentResolution(
+                    intent="analysis",
+                    ticker="NOW",
+                    confidence=0.99,
+                    explanation="The user asks for an investment evaluation, not an order.",
+                ),
+                text="",
+            )
+        ]
+    )
+    brain = GeminiOrchestrationBrain(
+        FakeMCPClient(),
+        client=SimpleNamespace(models=models),
+    )
+
+    result = brain.classify_intent("Check if ServiceNow is a buy right now")
+
+    assert result.intent == "analysis"
+    assert result.ticker == "NOW"
+    assert models.requests[0]["config"].response_json_schema["additionalProperties"] is False

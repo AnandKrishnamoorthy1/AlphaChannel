@@ -38,7 +38,12 @@
         "app_mentions:read",
         "chat:write",
         "assistant:write",
+        "channels:read",
+        "channels:history",
+        "groups:read",
+        "groups:history",
         "im:history",
+        "mpim:history",
         "search:read.public",
         "search:read.files",
         "search:read.users"

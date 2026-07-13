@@ -1,8 +1,11 @@
+"""SEC evidence pipeline for AlphaChannel's 2026 Slack Hackathon agent."""
+
 from __future__ import annotations
 
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -13,7 +16,7 @@ from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger("alpha_channel.engine.sec")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.sec")
 
 
 class SecFilingDocument(BaseModel):
@@ -64,7 +67,7 @@ class SecEdgarClient:
     def __init__(
         self,
         user_agent: str | None = None,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float | None = None,
         backend: Literal["edgartools", "raw"] | None = None,
     ) -> None:
         self.user_agent = (
@@ -73,10 +76,11 @@ class SecEdgarClient:
             or os.getenv("EDGAR_IDENTITY")
             or ""
         ).strip()
-        self.timeout_seconds = timeout_seconds
+        configured_timeout = timeout_seconds or float(os.getenv("SEC_EDGAR_HTTP_TIMEOUT_SECONDS", "8"))
+        self.timeout_seconds = max(2.0, configured_timeout)
         self.backend: Literal["edgartools", "raw"] = (
             backend
-            or os.getenv("SEC_EDGAR_BACKEND", "edgartools").strip().lower()
+            or os.getenv("SEC_EDGAR_BACKEND", "raw").strip().lower()
         )  # type: ignore[assignment]
         if self.backend not in {"edgartools", "raw"}:
             raise ValueError("SEC_EDGAR_BACKEND must be 'edgartools' or 'raw'.")
@@ -89,7 +93,7 @@ class SecEdgarClient:
         if not self.user_agent:
             raise RuntimeError(
                 "SEC EDGAR identity is required. Set EDGAR_IDENTITY='Organization contact@example.com' "
-                "in .env for EdgarTools fair access (SEC_EDGAR_USER_AGENT is supported for legacy raw mode)."
+                "in .env for EdgarTools fair access (SEC_EDGAR_USER_AGENT is also supported)."
             )
         normalized_ticker = ticker.strip().upper()
         cache_key = (normalized_ticker, forms)
@@ -106,7 +110,7 @@ class SecEdgarClient:
 
         if self.backend == "edgartools":
             try:
-                document = self._fetch_with_edgartools(normalized_ticker, forms)
+                document = self._fetch_with_edgartools_bounded(normalized_ticker, forms)
             except Exception as exc:
                 logger.warning(
                     "edgartools_fetch_failed_falling_back_to_raw",
@@ -128,6 +132,34 @@ class SecEdgarClient:
         )
         return document.model_copy(deep=True)
 
+    def _fetch_with_edgartools_bounded(
+        self,
+        ticker: str,
+        forms: tuple[str, ...],
+    ) -> SecFilingDocument:
+        """Bound EdgarTools so the official raw fallback can run within the MCP deadline."""
+        result_queue: queue.Queue[SecFilingDocument | BaseException] = queue.Queue(maxsize=1)
+
+        def fetch() -> None:
+            try:
+                result_queue.put_nowait(self._fetch_with_edgartools(ticker, forms))
+            except BaseException as exc:
+                result_queue.put_nowait(exc)
+
+        worker = threading.Thread(target=fetch, name=f"sec-edgartools-{ticker}", daemon=True)
+        worker.start()
+        deadline = max(2.0, float(os.getenv("SEC_EDGARTOOLS_TIMEOUT_SECONDS", "8")))
+        worker.join(timeout=deadline)
+        if worker.is_alive():
+            raise TimeoutError(f"EdgarTools did not complete within {deadline:.0f} seconds for {ticker}.")
+        try:
+            result = result_queue.get_nowait()
+        except queue.Empty as exc:
+            raise RuntimeError(f"EdgarTools returned no filing result for {ticker}.") from exc
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
     def _fetch_with_edgartools(
         self, ticker: str, forms: tuple[str, ...]
     ) -> SecFilingDocument:
@@ -137,7 +169,7 @@ class SecEdgarClient:
             "EDGAR_LOCAL_DATA_DIR",
             str(Path(__file__).resolve().parents[1] / ".edgar-data"),
         )
-        # EdgarTools reads this canonical variable independently of our legacy alias.
+        # EdgarTools reads this canonical identity variable directly.
         os.environ.setdefault("EDGAR_IDENTITY", self.user_agent)
         from edgar import Company
 
@@ -242,6 +274,9 @@ class SecEdgarClient:
         return self._request(url).decode("utf-8", errors="replace")
 
     def _request(self, url: str) -> bytes:
+        endpoint = "archives" if "/Archives/" in url else "submissions" if "submissions/" in url else "tickers"
+        started_at = time.monotonic()
+        logger.info("sec_edgar_http_request_started", extra={"endpoint": endpoint})
         with self._lock:
             wait_seconds = 0.15 - (time.monotonic() - self._last_request_at)
             if wait_seconds > 0:
@@ -256,7 +291,11 @@ class SecEdgarClient:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 body = response.read()
             self.__class__._last_request_at = time.monotonic()
-            return body
+        logger.info(
+            "sec_edgar_http_request_completed",
+            extra={"endpoint": endpoint, "elapsed_seconds": round(time.monotonic() - started_at, 3)},
+        )
+        return body
 
 
 class SecRiskMarker(BaseModel):
@@ -301,8 +340,8 @@ class SecRiskExtractor:
                     label="SEC parser not connected",
                     severity=0.35,
                     evidence=(
-                        "No 10-K/10-Q filing text was supplied by the wrapper. "
-                        "Connect Corporate Intelligence Core SEC ingestion for live footnoted risk markers."
+                        "No 10-K/10-Q filing text was available to AlphaChannel's 2026 Slack Hackathon "
+                        "SEC evidence pipeline."
                     ),
                 )
             ]

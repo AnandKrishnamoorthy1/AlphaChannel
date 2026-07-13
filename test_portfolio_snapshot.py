@@ -1,11 +1,11 @@
 from engine.portfolio_store import PortfolioStore
-from engine.trading_node import TradingNode, build_mock_portfolio
+from engine.trading_node import TradingNode, build_seed_portfolio
 from pathlib import Path
 from skills.stop_loss_take_profit.trigger_tools import StopLossTakeProfitEngine
 
 
-def test_mock_portfolio_calculates_equity_only_metrics() -> None:
-    snapshot = build_mock_portfolio()
+def test_seed_portfolio_calculates_equity_only_metrics() -> None:
+    snapshot = build_seed_portfolio()
 
     assert snapshot.portfolio_name == "Robinhood Agentic Account #X-4821"
     assert snapshot.cash_balance == 8_518.80
@@ -18,11 +18,20 @@ def test_mock_portfolio_calculates_equity_only_metrics() -> None:
 
 
 def test_trading_node_holdings_contract_contains_no_options_data() -> None:
-    holdings = TradingNode().get_portfolio_holdings()
+    db_path = Path("data/test_holdings_contract.db")
+    if db_path.exists():
+        db_path.unlink()
+    try:
+        holdings = TradingNode(portfolio_store=PortfolioStore(db_path)).get_portfolio_holdings()
 
-    assert {holding["ticker"] for holding in holdings} == {"NOW", "SNOW", "NU"}
-    assert all(holding["asset_type"] == "equity" for holding in holdings)
-    assert all("option" not in key.lower() for holding in holdings for key in holding)
+        assert {holding["ticker"] for holding in holdings} == {"NOW", "SNOW", "NU"}
+        assert all(holding["asset_type"] == "equity" for holding in holdings)
+        assert all("option" not in key.lower() for holding in holdings for key in holding)
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{db_path}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
 
 
 def test_approved_paper_sell_updates_persistent_position() -> None:
@@ -46,6 +55,46 @@ def test_approved_paper_sell_updates_persistent_position() -> None:
             candidate = Path(f"{db_path}{suffix}")
             if candidate.exists():
                 candidate.unlink()
+
+
+def test_new_ticker_buy_uses_live_reference_price() -> None:
+    db_path = Path("data/test_new_ticker_buy.db")
+    if db_path.exists():
+        db_path.unlink()
+    try:
+        store = PortfolioStore(db_path)
+
+        result = store.apply_dry_run_trade(
+            ticker="META",
+            side="buy",
+            notional_usd=500.0,
+            reference_price=625.0,
+            company_name="Meta Platforms, Inc.",
+            sector="Communication Services",
+        )
+        stored = store.load()
+        meta = next(position for position in stored["positions"] if position["ticker"] == "META")
+
+        assert result["state_changed"] is True
+        assert result["shares_changed"] == 0.8
+        assert meta["company_name"] == "Meta Platforms, Inc."
+        assert meta["fallback_market_price"] == 625.0
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{db_path}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+
+
+def test_live_price_extraction_supports_nested_yahoo_mcp_envelope() -> None:
+    payload = {
+        "quote": {
+            "symbol": "SNOW",
+            "regularMarketPrice": {"raw": 214.37, "fmt": "214.37"},
+        }
+    }
+
+    assert TradingNode._extract_live_price(payload) == 214.37
 
 
 def test_portfolio_monitor_uses_loss_profit_and_concentration_policy() -> None:

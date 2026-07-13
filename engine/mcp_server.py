@@ -97,7 +97,11 @@ def yfinance_fundamental_lookup(ticker: str) -> dict[str, object]:
     normalized_ticker = ticker.strip().upper()
     if not normalized_ticker or len(normalized_ticker) > 10:
         raise ValueError("ticker must be a valid market symbol")
-    result = YahooFinanceFundamentalsWorker().fetch_fundamental_signal(normalized_ticker).model_dump(mode="json")
+    signal = YahooFinanceFundamentalsWorker().fetch_fundamental_signal(normalized_ticker)
+    if signal.raw_metadata.get("feed_status") != "ok":
+        reason = "; ".join(signal.risk_markers) or "Yahoo Finance MCP returned no usable fundamentals."
+        raise RuntimeError(reason)
+    result = signal.model_dump(mode="json")
     result["source_url"] = f"https://finance.yahoo.com/quote/{normalized_ticker}/key-statistics"
     return result
 

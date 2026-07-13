@@ -111,7 +111,7 @@ AlphaChannel is not a command-to-script switchboard. `GeminiOrchestrationBrain` 
 | [`engine/yfinance_node.py`](engine/yfinance_node.py) | Investment fundamentals plus optional options and implied-volatility signals |
 | [`engine/trading_node.py`](engine/trading_node.py) | Portfolio state and human-governed mitigation checkpoints |
 
-The primary runtime brain is `GeminiOrchestrationBrain` in [`engine/core_router.py`](engine/core_router.py). It dynamically selects registered MCP tools, receives their results, continues multi-turn reasoning, and emits the validated risk synthesis. LangGraph remains in the same module only as a compatibility path for the older `run_assessment()` workflow; it is not the primary Slack agent loop.
+The runtime brain is `GeminiOrchestrationBrain` in [`engine/core_router.py`](engine/core_router.py). It dynamically selects registered MCP tools, receives their results, continues multi-turn reasoning, and emits validated structured synthesis.
 
 For deeper implementation notes, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -141,7 +141,7 @@ Users can connect a separately governed brokerage platform such as Robinhood, We
 
 ### Portfolio persistence and live prices
 
-The Portfolio Center stores account cash and equity positions in SQLite at `data/portfolio.db` by default. The file is ignored by Git and should live on a persistent application volume in a single-instance deployment. Each dashboard refresh attempts to replace stored demo prices with Yahoo Finance MCP prices and labels the source in Slack; fallback prices are used only when the provider is unavailable. For multi-instance or high-write production deployments, use a managed PostgreSQL-backed repository instead of sharing a SQLite file across containers.
+The Portfolio Center stores account cash and equity positions in SQLite at `data/portfolio.db` by default. The file is ignored by Git and should live on a persistent application volume in a single-instance deployment. Each dashboard refresh attempts to replace stored reference prices with Yahoo Finance MCP prices and labels the source in Slack. For multi-instance or high-write production deployments, use a managed transactional repository instead of sharing a SQLite file across containers.
 
 ## Quick start
 
@@ -162,10 +162,8 @@ On macOS or Linux, use `source venv/bin/activate` and `cp .env.example .env`.
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-socket-mode-token
 
-DASHSCOPE_API_KEY=sk-your-qwen-key
-DASHSCOPE_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-QWEN_MODEL=qwen3.6-flash
-QWEN_TIMEOUT_SECONDS=30
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-flash-latest
 
 # EdgarTools requires an identifiable organization and monitored contact address.
 EDGAR_IDENTITY=AlphaChannel your-email@example.com
@@ -185,7 +183,7 @@ Create the Slack app from [`manifest.json`](manifest.json), enable Socket Mode, 
 python app.py
 ```
 
-Validate the complete live-data path before a demo:
+Validate the complete live-data path before Hackathon judging:
 
 ```powershell
 python scripts/golden_path_smoke_test.py

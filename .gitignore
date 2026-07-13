@@ -1,119 +1,49 @@
-# Corporate Intelligence Engine - .gitignore
+# AlphaChannel 2026 Slack Hackathon
 
-# ============================================================================
-# ENVIRONMENT & CONFIGURATION (CRITICAL - NEVER COMMIT)
-# ============================================================================
+# Secrets and local configuration
 .env
 .env.local
 .env.*.local
-config/.env
 secrets/
 *.pem
 *.key
-deployment/access.yaml
-.s/access.yaml
-s/access.yaml
 
-# ============================================================================
-# PYTHON
-# ============================================================================
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
 *.so
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 .pytest_cache/
+pytest-cache-files-*/
 .coverage
 htmlcov/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
 
-# ============================================================================
-# VIRTUAL ENVIRONMENTS
-# ============================================================================
-venv/
-ENV/
-env/
-.venv
-env.bak/
-venv.bak/
+# Virtual environments
 venv/
 .venv/
 env/
+ENV/
 
-# ============================================================================
-# IDE & EDITORS
-# ============================================================================
-.vscode/settings.json
-.vscode/launch.json
+# Runtime data
+logs/
+*.log
+data/*.db
+data/*.db-*
+*.sqlite
+*.sqlite3
+.edgar-data/
+instance/
+
+# Editors and operating systems
+.vscode/
 .idea/
+.devcontainer/
 *.swp
 *.swo
 *~
 .DS_Store
-.vscode/
-.idea/
-.devcontainer/
-
-# ============================================================================
-# PROJECT SPECIFIC
-# ============================================================================
-logs/
-*.log
-.data/
-data/*.db
-data/*.db-*
-.edgar-data/
-*.pot
-*.mo
-.webassets-cache
-instance/
-backend_debug.log
-
-# ============================================================================
-# DATABASE
-# ============================================================================
-*.db
-*.sqlite
-*.sqlite3
-
-# ============================================================================
-# OS
-# ============================================================================
-.DS_Store
 Thumbs.db
-
-# ============================================================================
-# DOCKER
-# ============================================================================
-.dockerignore
-
-# ============================================================================
-# STREAMLIT
-# ============================================================================
-.streamlit/secrets.toml
-
-# ============================================================================
-# LangGraph
-# ============================================================================
-.langgraph_api/

@@ -11,6 +11,7 @@ from engine.yfinance_node import (
     YahooFinanceFundamentalsWorker,
     YahooFinanceOptionsWorker,
 )
+from engine.yahoo_finance_mcp_client import YahooFinanceMCPClient
 
 
 class SlowYahooWorker(YahooFinanceOptionsWorker):
@@ -74,6 +75,15 @@ def test_fundamental_signal_maps_investment_metrics() -> None:
     assert signal.forward_pe == 18.1
 
 
+def test_yahoo_finance_mcp_decodes_fastmcp_json_result() -> None:
+    payload = '{"currentPrice": 107.71, "trailingPE": 58.4, "totalRevenue": 12000000000}'
+
+    decoded = YahooFinanceMCPClient._decode_payload(payload)
+
+    assert decoded["currentPrice"] == 107.71
+    assert decoded["trailingPE"] == 58.4
+
+
 def test_mcp_timeout_returns_error_observation(monkeypatch: Any) -> None:
     client = AlphaChannelMCPClient(tool_timeout_seconds=2.0, persistent=False)
 
@@ -86,3 +96,25 @@ def test_mcp_timeout_returns_error_observation(monkeypatch: Any) -> None:
 
     assert result.is_error is True
     assert "mcp_tool_timeout" in result.output
+
+
+def test_sec_tool_uses_dedicated_longer_timeout(monkeypatch: Any) -> None:
+    monkeypatch.setenv("ALPHACHANNEL_SEC_TOOL_TIMEOUT_SECONDS", "60")
+    client = AlphaChannelMCPClient(tool_timeout_seconds=35, persistent=False)
+
+    assert client._execution_timeout("sec_risk_lookup") == 60
+    assert client._execution_timeout("system_status") == 35
+
+
+def test_sec_tool_isolated_from_persistent_session(monkeypatch: Any) -> None:
+    client = AlphaChannelMCPClient(tool_timeout_seconds=35, persistent=True)
+    sentinel = MCPToolExecution(tool_name="sec_risk_lookup", arguments={}, output="isolated")
+
+    monkeypatch.setattr(client, "_call_tool_one_shot", lambda tool_name, arguments: sentinel)
+    monkeypatch.setattr(
+        client,
+        "_call_tool_persistent",
+        lambda tool_name, arguments: (_ for _ in ()).throw(AssertionError("persistent path used")),
+    )
+
+    assert client.call_tool("sec_risk_lookup", {"ticker": "AMZN"}) is sentinel

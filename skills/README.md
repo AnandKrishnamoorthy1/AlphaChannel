@@ -1,63 +1,26 @@
-"""Skills Architecture Documentation
+# AlphaChannel Skills
 
-This directory contains reusable, modular AI agent skills that encapsulate
-domain-specific workflows and tools.
+AlphaChannel skills are deterministic governance policies used by the 2026 Slack Hackathon agent. Each skill keeps its operating instructions in `SKILL.md` and its executable policy logic in a colocated Python module.
 
-## What are Skills?
+## Active Skills
 
-Skills are self-contained, procedural artifacts that bundle:
-- Task-specific execution instructions (SKILL.md)
-- Implementation code (tools.py)
-- Reusable algorithms and logic
+- `stop_loss_take_profit`: loss, return, single-stock, and sector concentration alerts
+- `portfolio_analyzer`: allocation and diversification analysis
+- `risk_manager`: portfolio-level governance checks
 
-Instead of overwhelming the LLM with all available tools upfront, skills enable
-**progressive disclosure**: the agent sees lightweight metadata initially, loading
-full procedures only when a task triggers that domain.
-
-## Skill Discovery
-
-The SkillRegistry loads YAML manifests from each skill's SKILL.md file:
+The Portfolio Center invokes the monitoring engine directly:
 
 ```python
-from app.skills import get_skill_registry
+from skills.stop_loss_take_profit.trigger_tools import StopLossTakeProfitEngine
 
-registry = get_skill_registry()
-available_skills = registry.list_all_skills()  # ["portfolio_analyzer", "risk_manager", ...]
+report = StopLossTakeProfitEngine().assess_all_triggers(portfolio)
 ```
 
-## Invoking Skills
+## Governance Thresholds
 
-Skills are invoked by name with domain-specific parameters:
+- Stop-loss alert: loss reaches 20% of cost basis
+- Take-profit alert: gain exceeds 50% of cost basis
+- Single-stock concentration: position exceeds 15% of total portfolio value, including cash
+- Sector concentration: sector exceeds 30% of total portfolio value, including cash
 
-```python
-from app.skills import invoke_skill
-
-# Portfolio analysis
-portfolio_report = invoke_skill(
-    "portfolio_analyzer",
-    portfolio={"positions": [...], "cash": 1000, "total_value": 10000}
-)
-
-# Risk assessment
-risk_report = invoke_skill(
-    "risk_manager",
-    portfolio=portfolio_data,
-    risk_tolerance="moderate"
-)
-```
-
-## Available Skills
-
-1. **portfolio_analyzer**: Analyze diversification, asset allocation, sector exposure
-2. **risk_manager**: Multi-factor portfolio risk assessment with alerts
-3. **stop_loss_take_profit**: Monitor positions against thresholds, trigger alerts, pre-trade validation
-
-See individual SKILL.md files for detailed documentation.
-
-## Demo-Ready Thresholds
-
-**Skill 3 (Stop-Loss/Take-Profit) is configured with LOW thresholds for easy demonstration:**
-- Concentration alert: **50%** (triggers readily with TSLA, NVDA, etc.)
-- Stop-loss: -10%
-- Take-profit: +30%
-"""
+Skills produce recommendations and alerts only. Any consequential portfolio action remains approval-gated in Slack.

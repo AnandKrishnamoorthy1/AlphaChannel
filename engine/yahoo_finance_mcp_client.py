@@ -1,4 +1,4 @@
-"""Bounded persistent client for the community Yahoo Finance MCP server."""
+"""Bounded Yahoo Finance MCP client for AlphaChannel's 2026 Slack Hackathon agent."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 import threading
 from typing import Any
 
-logger = logging.getLogger("alpha_channel.engine.yahoo_mcp")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.yahoo_mcp")
 
 
 class YahooFinanceMCPClient:
@@ -44,6 +44,27 @@ class YahooFinanceMCPClient:
         result = self.call_tool("get_stock_info", {"ticker": ticker.strip().upper()})
         if not isinstance(result, dict):
             raise RuntimeError("Yahoo Finance MCP returned an empty stock-info response.")
+        return result
+
+    def get_financial_statement(self, ticker: str, financial_type: str) -> list[dict[str, Any]]:
+        allowed_types = {
+            "income_stmt",
+            "quarterly_income_stmt",
+            "balance_sheet",
+            "quarterly_balance_sheet",
+            "cashflow",
+            "quarterly_cashflow",
+        }
+        if financial_type not in allowed_types:
+            raise ValueError(f"Unsupported Yahoo Finance MCP statement type: {financial_type}")
+        result = self.call_tool(
+            "get_financial_statement",
+            {"ticker": ticker.strip().upper(), "financial_type": financial_type},
+        )
+        if not isinstance(result, list) or not all(isinstance(row, dict) for row in result):
+            raise RuntimeError(
+                f"Yahoo Finance MCP returned an invalid {financial_type} response for {ticker}."
+            )
         return result
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
@@ -94,14 +115,37 @@ class YahooFinanceMCPClient:
 
     async def _call_tool_async(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         result = await self._session.call_tool(tool_name, arguments=arguments)
+        if bool(getattr(result, "isError", False)):
+            error_text = "\n".join(
+                str(getattr(item, "text", ""))
+                for item in (getattr(result, "content", None) or [])
+                if getattr(item, "text", None)
+            ).strip()
+            raise RuntimeError(error_text or f"Yahoo Finance MCP tool {tool_name} failed.")
         structured = getattr(result, "structuredContent", None)
         if isinstance(structured, dict):
-            return structured.get("result", structured)
+            return self._decode_payload(structured.get("result", structured))
         for item in getattr(result, "content", []) or []:
             text = getattr(item, "text", None)
             if text:
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
+                return self._decode_payload(text)
         return None
+
+    @staticmethod
+    def _decode_payload(payload: Any) -> Any:
+        """Decode FastMCP result envelopes that contain JSON encoded as a string."""
+        decoded = payload
+        for _ in range(3):
+            if isinstance(decoded, dict) and set(decoded) == {"result"}:
+                decoded = decoded["result"]
+                continue
+            if not isinstance(decoded, str):
+                break
+            candidate = decoded.strip()
+            if not candidate:
+                return None
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                return candidate
+        return decoded

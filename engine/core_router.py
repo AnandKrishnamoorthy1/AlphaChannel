@@ -14,19 +14,17 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from engine.agent_brain import BrainRunResult
-from engine.sec_node import SecRiskExtractor, SecRiskMarker
 from engine.mcp_client import AlphaChannelMCPClient, MCPToolExecution
-from engine.trading_node import TargetMitigationOrder, TradingNode
-from engine.yfinance_node import OptionsRiskMarker, YahooFinanceOptionsWorker
+from engine.trading_node import TradingNode
 
-logger = logging.getLogger("alpha_channel.engine.router")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.router")
 
 
 class WorkspaceMessage(BaseModel):
@@ -65,59 +63,6 @@ class InternalWorkspacePerception(BaseModel):
         return f"{self.query}\n{message_text}\n{attachment_text}".strip()
 
 
-class RiskAssessmentRequest(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    ticker: str
-    query: str
-    requested_by: str
-    channel_id: str
-    internal_workspace_perception: InternalWorkspacePerception
-    sec_filing_text: str | None = None
-    sec_pdf_paths: list[str] = Field(default_factory=list)
-
-    @field_validator("ticker")
-    @classmethod
-    def normalize_ticker(cls, value: str) -> str:
-        ticker = value.upper().strip().lstrip("$")
-        if not ticker:
-            raise ValueError("ticker is required")
-        return ticker
-
-
-class RiskAssessmentResponse(BaseModel):
-    assessment_id: str
-    ticker: str
-    internal_consensus_percent: float = Field(ge=0.0, le=100.0)
-    internal_evidence: list[str] = Field(default_factory=list)
-    external_risk_markers: list[str] = Field(default_factory=list)
-    max_external_severity: float = Field(ge=0.0, le=1.0)
-    verdict: str
-    target_mitigation_orders: list[TargetMitigationOrder] = Field(default_factory=list)
-
-    def to_standard_dict(self) -> dict[str, Any]:
-        return {
-            "assessment_id": self.assessment_id,
-            "Ticker": self.ticker,
-            "Internal Consensus %": f"{self.internal_consensus_percent:.0f}%",
-            "External Risk Markers": self.external_risk_markers,
-            "Verdict": self.verdict,
-            "Target Mitigation Orders": [order.model_dump(mode="json") for order in self.target_mitigation_orders],
-        }
-
-
-class AssessmentState(TypedDict, total=False):
-    request: RiskAssessmentRequest
-    sec_markers: list[SecRiskMarker]
-    options_markers: list[OptionsRiskMarker]
-    external_markers: list[SecRiskMarker | OptionsRiskMarker]
-    internal_consensus_percent: float
-    internal_evidence: list[str]
-    max_external_severity: float
-    verdict: str
-    target_mitigation_orders: list[TargetMitigationOrder]
-
-
 class AgentTurnRequest(BaseModel):
     channel_id: str
     thread_ts: str
@@ -132,6 +77,19 @@ class DirectTradeIntent(BaseModel):
     ticker: str
     side: Literal["buy", "sell", "hedge"]
     notional_usd: float | None = Field(default=None, gt=0)
+
+
+class IntentResolution(BaseModel):
+    """Structured natural-language intent classification before tool execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    intent: Literal["trade", "analysis", "portfolio", "engineering", "general"]
+    ticker: str | None = Field(default=None, max_length=12)
+    side: Literal["buy", "sell", "hedge"] | None = None
+    notional_usd: float | None = Field(default=None, gt=0)
+    confidence: float = Field(ge=0, le=1)
+    explanation: str = Field(default="", max_length=500)
 
 
 class ConversationTurn(BaseModel):
@@ -227,6 +185,8 @@ public-company financial risk questions, portfolio tools for holdings questions,
 when the user explicitly requests a consequential action. Never fabricate tool observations. Select exactly
 one function per reasoning turn. The host enforces execution policy and human approval. When sufficient
 evidence has been collected, stop calling functions so the host can request the final structured synthesis.
+For educational or definitional questions such as "What is a P/E ratio?", answer directly without selecting
+any ticker-specific market or SEC tool. Do not infer an asset from Slack history or prior turns.
 For an investment or risk assessment, MUST use yfinance_fundamental_lookup for valuation and operating metrics
 (P/E, revenue, growth, margins, ROE, debt-to-equity) and sec_risk_lookup for filing evidence. Never use
 yfinance_risk_lookup for a normal investment assessment; that tool is only for explicit options, volatility,
@@ -238,6 +198,15 @@ arguments. For a simple holdings request, portfolio_holdings alone is sufficient
     FINAL_SYNTHESIS_INSTRUCTION = (
         "Using only the workspace context and MCP observations in this conversation, produce the final "
         "institutional perception-versus-reality risk assessment. Return every field required by the schema."
+    )
+
+    INTENT_CLASSIFICATION_INSTRUCTION = (
+        "Classify the user's request before tool execution. Return trade only for an explicit execution request such as "
+        "Buy $500 of NOW or sell 10 shares of NU. Return analysis when the user asks whether a stock is a buy, risky, "
+        "or requests an evaluation, even if buy or sell appears. Return portfolio for holdings, positions, allocation, "
+        "or dashboard requests. Return general for educational or definitional questions such as asking what a "
+        "P/E ratio means. Resolve company names and spelling errors to tickers when possible. Never invent a "
+        "notional amount. A missing notional is valid for trade intent and should cause the host to ask for one."
     )
 
     ASSET_RESOLUTION_INSTRUCTION = """Extract the investment asset explicitly requested in the user's goal.
@@ -269,6 +238,43 @@ invent a ticker."""
         self.model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         self.max_iterations = max_iterations
         self.max_tool_calls = max(1, int(os.getenv("GEMINI_MAX_TOOL_CALLS", "4")))
+
+    def classify_intent(self, goal: str) -> IntentResolution:
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[{"role": "user", "parts": [{"text": goal}]}],
+            config=types.GenerateContentConfig(
+                system_instruction=self.INTENT_CLASSIFICATION_INSTRUCTION,
+                response_mime_type="application/json",
+                response_json_schema=IntentResolution.model_json_schema(),
+                temperature=0,
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, IntentResolution):
+            return parsed
+        if parsed is not None:
+            return IntentResolution.model_validate(parsed)
+        return IntentResolution.model_validate_json(response.text or "")
+
+    def answer_general_question(self, goal: str) -> str:
+        """Answer explanatory questions without exposing financial tools to the model."""
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[{"role": "user", "parts": [{"text": goal}]}],
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are AlphaChannel's financial education assistant. Answer the user's explanatory "
+                    "question directly and concisely. Do not infer a ticker, do not call tools, and do not "
+                    "present an investment recommendation unless the user explicitly asks for one."
+                ),
+                temperature=0.15,
+            ),
+        )
+        answer = str(getattr(response, "text", "") or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty explanatory answer.")
+        return answer
 
     def run(
         self,
@@ -707,52 +713,25 @@ invent a ticker."""
 class AlphaChannelRouter:
     """Stateful multi-agent orchestrator for Slack-driven governance risk checks."""
 
-    BULLISH_TERMS = {
-        "buy",
-        "bullish",
-        "long",
-        "allocate",
-        "accumulate",
-        "upside",
-        "breakout",
-        "conviction",
-        "undervalued",
-        "greenlight",
-        "growth",
-    }
-    BEARISH_TERMS = {
-        "sell",
-        "bearish",
-        "short",
-        "hedge",
-        "avoid",
-        "risk",
-        "overvalued",
-        "drawdown",
-        "liquidity",
-        "delinquency",
-        "default",
-        "impairment",
-    }
-
     def __init__(
         self,
         *,
-        sec_node: SecRiskExtractor | None = None,
-        yfinance_node: YahooFinanceOptionsWorker | None = None,
         trading_node: TradingNode | None = None,
         mcp_client: AlphaChannelMCPClient | None = None,
         agent_brain: Any | None = None,
     ) -> None:
-        self.sec_node = sec_node or SecRiskExtractor()
-        self.yfinance_node = yfinance_node or YahooFinanceOptionsWorker()
         self.trading_node = trading_node or TradingNode()
         self.mcp_client = mcp_client or AlphaChannelMCPClient()
         self.agent_brain = agent_brain or GeminiOrchestrationBrain(self.mcp_client)
         self._conversation_lock = threading.RLock()
+        try:
+            configured_threshold = float(os.getenv("ALPHACHANNEL_INTENT_CONFIDENCE_THRESHOLD", "0.60"))
+        except (TypeError, ValueError):
+            configured_threshold = 0.60
+            logger.warning("invalid_intent_confidence_threshold_using_default")
+        self.intent_confidence_threshold = min(1.0, max(0.0, configured_threshold))
         self._conversations: dict[str, list[ConversationTurn]] = {}
         self._pending_actions: dict[str, PendingToolAction] = {}
-        self._graph = self._build_graph()
 
     @staticmethod
     def _conversation_key(channel_id: str, thread_ts: str) -> str:
@@ -788,9 +767,32 @@ class AlphaChannelRouter:
                 conversation_turn_count=turn_count,
             )
 
-        direct_trade = self._extract_direct_trade_intent(request.text)
+        resolved_intent = self._resolve_intent(request.text)
+        direct_trade = self._direct_trade_from_resolution(resolved_intent)
+        if direct_trade is None and resolved_intent is None:
+            direct_trade = self._extract_direct_trade_intent(request.text)
         if direct_trade is not None:
             return self._create_direct_trade_checkpoint(request, direct_trade, key)
+
+        if resolved_intent is not None and resolved_intent.intent == "general":
+            answer_general = getattr(self.agent_brain, "answer_general_question", None)
+            if not callable(answer_general):
+                raise RuntimeError("The configured agent brain cannot answer general questions.")
+            message = str(answer_general(request.text)).strip()
+            with self._conversation_lock:
+                turns = self._conversations[key]
+                turns.append(ConversationTurn(role="assistant", content=message))
+                turn_count = len(turns)
+            logger.info(
+                "general_question_answered_without_tools",
+                extra={"channel_id": request.channel_id, "thread_ts": request.thread_ts},
+            )
+            return AgentTurnResponse(
+                channel_id=request.channel_id,
+                thread_ts=request.thread_ts,
+                message=message,
+                conversation_turn_count=turn_count,
+            )
 
         conversation = [
             {
@@ -832,6 +834,51 @@ class AlphaChannelRouter:
             tool_executions=executions,
             pending_action=pending_action,
             conversation_turn_count=turn_count,
+        )
+
+    def _resolve_intent(self, text: str) -> IntentResolution | None:
+        classifier = getattr(self.agent_brain, "classify_intent", None)
+        if not callable(classifier):
+            return None
+        try:
+            resolution = classifier(text)
+            if not isinstance(resolution, IntentResolution):
+                resolution = IntentResolution.model_validate(resolution)
+            if resolution.confidence < self.intent_confidence_threshold:
+                logger.warning(
+                    "intent_classification_low_confidence_using_regex_fallback",
+                    extra={
+                        "confidence": resolution.confidence,
+                        "threshold": self.intent_confidence_threshold,
+                        "intent": resolution.intent,
+                        "text_chars": len(text),
+                    },
+                )
+                return None
+            logger.info(
+                "intent_classification_accepted",
+                extra={
+                    "confidence": resolution.confidence,
+                    "threshold": self.intent_confidence_threshold,
+                    "intent": resolution.intent,
+                },
+            )
+            return resolution
+        except Exception as exc:
+            logger.warning(
+                "intent_classification_failed_using_model_loop",
+                extra={"error_type": type(exc).__name__, "error": str(exc)},
+            )
+            return None
+
+    @staticmethod
+    def _direct_trade_from_resolution(resolution: IntentResolution | None) -> DirectTradeIntent | None:
+        if resolution is None or resolution.intent != "trade" or not resolution.ticker or not resolution.side:
+            return None
+        return DirectTradeIntent(
+            ticker=resolution.ticker.strip().upper().lstrip("$"),
+            side=resolution.side,
+            notional_usd=resolution.notional_usd,
         )
 
     def _create_direct_trade_checkpoint(
@@ -925,6 +972,11 @@ class AlphaChannelRouter:
     def _extract_direct_trade_intent(cls, text: str) -> DirectTradeIntent | None:
         normalized = text.strip()
         lowered = normalized.lower()
+        explicit_trade_command = bool(
+            re.match(r"^\s*(?:please\s+)?(buy|sell|purchase|acquire|liquidate|hedge|protect)\b", lowered)
+        )
+        if not explicit_trade_command:
+            return None
         side: Literal["buy", "sell", "hedge"] | None = None
         if re.search(r"\b(buy|purchase|acquire)\b", lowered):
             side = "buy"
@@ -1061,7 +1113,28 @@ class AlphaChannelRouter:
 
     def deny_agent_action(self, action_id: str, decided_by: str) -> AgentTurnResponse:
         with self._conversation_lock:
-            pending = self._require_pending_action(action_id)
+            pending = self._pending_actions.get(action_id)
+            if pending is None:
+                return AgentTurnResponse(
+                    channel_id="unknown",
+                    thread_ts="unknown",
+                    message="This action checkpoint has expired and no tool was executed.",
+                )
+            if pending.status == "denied":
+                return AgentTurnResponse(
+                    channel_id=pending.channel_id,
+                    thread_ts=pending.thread_ts,
+                    message=f"This `{pending.tool_name}` checkpoint was already denied. No tool was executed.",
+                )
+            if pending.status in {"executing", "executed"}:
+                return AgentTurnResponse(
+                    channel_id=pending.channel_id,
+                    thread_ts=pending.thread_ts,
+                    message=(
+                        f"This `{pending.tool_name}` checkpoint is already {pending.status}; "
+                        "the stale Deny button made no additional state change."
+                    ),
+                )
             pending.status = "denied"
             key = self._conversation_key(pending.channel_id, pending.thread_ts)
             turns = self._conversations.setdefault(key, [])
@@ -1140,44 +1213,6 @@ class AlphaChannelRouter:
         with self._conversation_lock:
             self._pending_actions[pending.action_id] = pending
         return pending
-
-    def run_assessment(self, request: RiskAssessmentRequest) -> RiskAssessmentResponse:
-        logger.info(
-            "risk_assessment_started",
-            extra={
-                "ticker": request.ticker,
-                "channel_id": request.channel_id,
-                "requested_by": request.requested_by,
-                "context_result_count": request.internal_workspace_perception.raw_result_count,
-            },
-        )
-        state: AssessmentState = {"request": request}
-        if self._graph is not None:
-            final_state = self._graph.invoke(state)
-        else:
-            final_state = self._decision_checkpoint(self._sentiment_synthesis(self._external_reality(state)))
-
-        response = RiskAssessmentResponse(
-            assessment_id=str(uuid.uuid4()),
-            ticker=request.ticker,
-            internal_consensus_percent=final_state["internal_consensus_percent"],
-            internal_evidence=final_state["internal_evidence"],
-            external_risk_markers=[marker.as_display_text() for marker in final_state["external_markers"]],
-            max_external_severity=final_state["max_external_severity"],
-            verdict=final_state["verdict"],
-            target_mitigation_orders=final_state["target_mitigation_orders"],
-        )
-        logger.info(
-            "risk_assessment_completed",
-            extra={
-                "assessment_id": response.assessment_id,
-                "ticker": response.ticker,
-                "internal_consensus_percent": response.internal_consensus_percent,
-                "max_external_severity": response.max_external_severity,
-                "verdict": response.verdict,
-            },
-        )
-        return response
 
     def handle_trading_checkpoint(
         self,
@@ -1296,111 +1331,3 @@ class AlphaChannelRouter:
             )
 
         return return_blocks
-
-    def _build_graph(self) -> Any | None:
-        try:
-            from langgraph.graph import END, StateGraph
-
-            graph = StateGraph(AssessmentState)
-            graph.add_node("external_reality", self._external_reality)
-            graph.add_node("sentiment_synthesis", self._sentiment_synthesis)
-            graph.add_node("decision_checkpoint", self._decision_checkpoint)
-            graph.set_entry_point("external_reality")
-            graph.add_edge("external_reality", "sentiment_synthesis")
-            graph.add_edge("sentiment_synthesis", "decision_checkpoint")
-            graph.add_edge("decision_checkpoint", END)
-            return graph.compile()
-        except Exception as exc:
-            logger.warning("langgraph_compile_failed_using_sequential_router", extra={"error": str(exc)})
-            return None
-
-    def _external_reality(self, state: AssessmentState) -> AssessmentState:
-        request = state["request"]
-        sec_markers = self.sec_node.extract_risk_markers(
-            ticker=request.ticker,
-            filing_text=request.sec_filing_text,
-            pdf_paths=request.sec_pdf_paths,
-        )
-        options_signal = self.yfinance_node.fetch_options_signal(request.ticker)
-        external_markers: list[SecRiskMarker | OptionsRiskMarker] = [*sec_markers, *options_signal.risk_markers]
-        return {
-            **state,
-            "sec_markers": sec_markers,
-            "options_markers": options_signal.risk_markers,
-            "external_markers": external_markers,
-        }
-
-    def _sentiment_synthesis(self, state: AssessmentState) -> AssessmentState:
-        request = state["request"]
-        corpus = request.internal_workspace_perception.text_corpus()
-        bullish_hits = self._count_terms(corpus, self.BULLISH_TERMS)
-        bearish_hits = self._count_terms(corpus, self.BEARISH_TERMS)
-        internal_consensus_percent = ((bullish_hits + 1) / (bullish_hits + bearish_hits + 2)) * 100
-        evidence = self._extract_internal_evidence(request.internal_workspace_perception)
-        markers = state["external_markers"]
-        max_external_severity = max((marker.severity for marker in markers), default=0.0)
-        verdict = self._evaluate_divergence(internal_consensus_percent, max_external_severity)
-
-        logger.info(
-            "sentiment_synthesis_completed",
-            extra={
-                "ticker": request.ticker,
-                "bullish_hits": bullish_hits,
-                "bearish_hits": bearish_hits,
-                "internal_consensus_percent": internal_consensus_percent,
-                "max_external_severity": max_external_severity,
-                "verdict": verdict,
-            },
-        )
-        return {
-            **state,
-            "internal_consensus_percent": internal_consensus_percent,
-            "internal_evidence": evidence,
-            "max_external_severity": max_external_severity,
-            "verdict": verdict,
-        }
-
-    def _decision_checkpoint(self, state: AssessmentState) -> AssessmentState:
-        request = state["request"]
-        orders = self.trading_node.build_mitigation_orders(
-            ticker=request.ticker,
-            verdict=state["verdict"],
-            internal_consensus_percent=state["internal_consensus_percent"],
-            max_external_severity=state["max_external_severity"],
-        )
-        return {**state, "target_mitigation_orders": orders}
-
-    @classmethod
-    def _count_terms(cls, corpus: str, terms: set[str]) -> int:
-        normalized = corpus.lower()
-        return sum(len(re.findall(rf"\b{re.escape(term)}\b", normalized)) for term in terms)
-
-    @staticmethod
-    def _extract_internal_evidence(perception: InternalWorkspacePerception) -> list[str]:
-        evidence: list[str] = []
-        for message in perception.context_messages[:5]:
-            if message.text:
-                evidence.append(message.text[:240])
-        for attachment in perception.file_attachments[:3]:
-            label = attachment.title or "Slack attachment"
-            summary = attachment.summary or attachment.filetype or "No summary supplied"
-            evidence.append(f"{label}: {summary[:220]}")
-        return evidence or [perception.query]
-
-    @staticmethod
-    def _evaluate_divergence(internal_consensus_percent: float, max_external_severity: float) -> str:
-        if internal_consensus_percent >= 65 and max_external_severity >= 0.65:
-            return (
-                "Executive Blind Spot: internal Slack sentiment is bullish while SEC/options reality "
-                "signals material downside risk."
-            )
-        if internal_consensus_percent <= 40 and max_external_severity <= 0.35:
-            return (
-                "Contrarian Opportunity: internal sentiment is cautious, but external risk markers "
-                "are currently contained."
-            )
-        if max_external_severity >= 0.75:
-            return "External Risk Override: market or SEC stress markers require mitigation before allocation."
-        if internal_consensus_percent >= 65:
-            return "Aligned Bullish Case: internal conviction is constructive and external stress is manageable."
-        return "Governance Review Required: perception and external reality are mixed."

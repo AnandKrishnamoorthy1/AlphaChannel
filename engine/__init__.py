@@ -1,3 +1,5 @@
-from engine.core_router import AlphaChannelRouter, RiskAssessmentRequest, RiskAssessmentResponse
+"""AlphaChannel's Gemini, MCP, SEC, portfolio, and governance runtime."""
 
-__all__ = ["AlphaChannelRouter", "RiskAssessmentRequest", "RiskAssessmentResponse"]
+from engine.core_router import AlphaChannelRouter
+
+__all__ = ["AlphaChannelRouter"]

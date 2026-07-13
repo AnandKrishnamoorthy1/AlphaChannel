@@ -1,4 +1,4 @@
-"""SQLite persistence for the demo Robinhood-style portfolio account."""
+"""SQLite persistence for AlphaChannel's governed paper portfolio account."""
 
 from __future__ import annotations
 
@@ -120,7 +120,16 @@ class PortfolioStore:
             "positions": [dict(position) for position in positions],
         }
 
-    def apply_dry_run_trade(self, *, ticker: str, side: str, notional_usd: float) -> dict[str, Any]:
+    def apply_dry_run_trade(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        notional_usd: float,
+        reference_price: float | None = None,
+        company_name: str | None = None,
+        sector: str | None = None,
+    ) -> dict[str, Any]:
         """Apply an approved paper-trade transition to the persisted portfolio."""
         normalized_ticker = ticker.strip().upper()
         if notional_usd <= 0:
@@ -143,7 +152,13 @@ class PortfolioStore:
 
             cash_balance = float(account["cash_balance"])
             if side == "buy":
-                price = float(position["fallback_market_price"]) if position else 0.0
+                price = (
+                    float(reference_price)
+                    if reference_price is not None and reference_price > 0
+                    else float(position["fallback_market_price"])
+                    if position
+                    else 0.0
+                )
                 if price <= 0:
                     raise ValueError(f"No reference price is available for {normalized_ticker}.")
                 if notional_usd > cash_balance:
@@ -157,10 +172,11 @@ class PortfolioStore:
                     connection.execute(
                         """
                         UPDATE portfolio_positions
-                        SET shares_held = ?, average_buy_price = ?, updated_at = CURRENT_TIMESTAMP
+                        SET shares_held = ?, average_buy_price = ?, fallback_market_price = ?,
+                            updated_at = CURRENT_TIMESTAMP
                         WHERE account_id = ? AND ticker = ?
                         """,
-                        (new_shares, new_average, self.ACCOUNT_ID, normalized_ticker),
+                        (new_shares, new_average, price, self.ACCOUNT_ID, normalized_ticker),
                     )
                 else:
                     connection.execute(
@@ -169,13 +185,25 @@ class PortfolioStore:
                             (account_id, ticker, company_name, sector, shares_held, average_buy_price, fallback_market_price)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (self.ACCOUNT_ID, normalized_ticker, normalized_ticker, "Unknown", shares_added, price, price),
+                        (
+                            self.ACCOUNT_ID,
+                            normalized_ticker,
+                            company_name or normalized_ticker,
+                            sector or "Unknown",
+                            shares_added,
+                            price,
+                            price,
+                        ),
                     )
                 shares_changed = shares_added
             else:
                 if position is None:
                     raise ValueError(f"No position exists for {normalized_ticker}.")
-                price = float(position["fallback_market_price"])
+                price = (
+                    float(reference_price)
+                    if reference_price is not None and reference_price > 0
+                    else float(position["fallback_market_price"])
+                )
                 shares_available = float(position["shares_held"])
                 shares_changed = min(shares_available, notional_usd / price)
                 proceeds = shares_changed * price

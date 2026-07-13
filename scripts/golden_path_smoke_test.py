@@ -23,7 +23,7 @@ def main() -> None:
         AgentTurnRequest(
             channel_id="GOLDEN_PATH",
             thread_ts="1.0",
-            user_id="DEMO_OPERATOR",
+            user_id="HACKATHON_OPERATOR",
             text="Check if ServiceNow is a risky buy right now.",
             workspace_context=(
                 "Engineering leadership is optimistic about enterprise AI demand. Procurement is monitoring "
@@ -33,7 +33,7 @@ def main() -> None:
         progress_callback=lambda status: print(f"[progress] {status}"),
     )
     called_tools = [execution.tool_name for execution in response.tool_executions]
-    required_tools = {"yfinance_risk_lookup", "sec_risk_lookup"}
+    required_tools = {"yfinance_fundamental_lookup", "sec_risk_lookup"}
     missing_tools = required_tools.difference(called_tools)
     if missing_tools:
         raise RuntimeError(f"Golden path did not call required MCP tools: {sorted(missing_tools)}")

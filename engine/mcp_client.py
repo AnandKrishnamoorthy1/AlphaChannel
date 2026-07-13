@@ -1,3 +1,5 @@
+"""Governed MCP transport for AlphaChannel's 2026 Slack Hackathon agent."""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger("alpha_channel.engine.mcp")
+logger = logging.getLogger("alpha_channel.hackathon_2026.engine.mcp")
 
 
 class MCPToolPolicy(BaseModel):
@@ -74,19 +76,6 @@ class AlphaChannelMCPClient:
         except KeyError as exc:
             raise ValueError(f"Unregistered MCP tool: {tool_name}") from exc
 
-    def openai_tool_schemas(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": definition["name"],
-                    "description": definition["description"],
-                    "parameters": definition.get("input_schema", {"type": "object", "properties": {}}),
-                },
-            }
-            for definition in self._tool_definitions.values()
-        ]
-
     def gemini_function_declarations(self) -> list[dict[str, Any]]:
         """Expose MCP input schemas as native google-genai declarations."""
         return [
@@ -102,6 +91,11 @@ class AlphaChannelMCPClient:
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolExecution:
         self.policy_for(tool_name)
+        # SEC libraries perform synchronous network and document parsing work.
+        # Isolate each lookup so a timed-out operation cannot poison the shared
+        # persistent MCP session or delay later Slack requests.
+        if tool_name == "sec_risk_lookup":
+            return self._call_tool_one_shot(tool_name, arguments)
         if self._persistent:
             return self._call_tool_persistent(tool_name, arguments)
         return self._call_tool_one_shot(tool_name, arguments)
@@ -128,15 +122,29 @@ class AlphaChannelMCPClient:
         if loop and stop and loop.is_running():
             loop.call_soon_threadsafe(stop.set)
 
+    def _execution_timeout(self, tool_name: str) -> float:
+        if tool_name == "sec_risk_lookup":
+            return max(
+                10.0,
+                float(os.getenv("ALPHACHANNEL_SEC_TOOL_TIMEOUT_SECONDS", "30")),
+            )
+        return self._tool_timeout_seconds
+
     def _call_tool_persistent(
         self,
         tool_name: str,
         arguments: dict[str, Any],
     ) -> MCPToolExecution:
         self.warmup_async()
-        startup_timeout = min(15.0, self._tool_timeout_seconds)
+        execution_timeout = self._execution_timeout(tool_name)
+        startup_timeout = min(15.0, execution_timeout)
         if not self._connection_ready.wait(timeout=startup_timeout):
-            return self._timeout_execution(tool_name, arguments, phase="startup")
+            return self._timeout_execution(
+                tool_name,
+                arguments,
+                phase="startup",
+                timeout_seconds=execution_timeout,
+            )
         if self._connection_error is not None:
             raise RuntimeError("Persistent MCP session failed to start.") from self._connection_error
 
@@ -156,10 +164,15 @@ class AlphaChannelMCPClient:
                 loop,
             )
             try:
-                result = future.result(timeout=self._tool_timeout_seconds)
+                result = future.result(timeout=execution_timeout)
             except concurrent.futures.TimeoutError:
                 future.cancel()
-                return self._timeout_execution(tool_name, arguments, phase="execution")
+                return self._timeout_execution(
+                    tool_name,
+                    arguments,
+                    phase="execution",
+                    timeout_seconds=execution_timeout,
+                )
         return self._execution_from_result(tool_name, arguments, result)
 
     def _call_tool_one_shot(
@@ -167,6 +180,7 @@ class AlphaChannelMCPClient:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> MCPToolExecution:
+        execution_timeout = self._execution_timeout(tool_name)
         result_queue: queue.Queue[MCPToolExecution | BaseException] = queue.Queue(maxsize=1)
 
         def invoke() -> None:
@@ -175,7 +189,7 @@ class AlphaChannelMCPClient:
                     asyncio.run(
                         asyncio.wait_for(
                             self._call_tool(tool_name, arguments),
-                            timeout=self._tool_timeout_seconds,
+                            timeout=execution_timeout,
                         )
                     )
                 )
@@ -188,16 +202,16 @@ class AlphaChannelMCPClient:
             daemon=True,
         )
         worker.start()
-        worker.join(timeout=self._tool_timeout_seconds)
+        worker.join(timeout=execution_timeout)
         if worker.is_alive():
-            return self._timeout_execution(tool_name, arguments)
+            return self._timeout_execution(tool_name, arguments, timeout_seconds=execution_timeout)
 
         try:
             result = result_queue.get_nowait()
         except queue.Empty:
-            return self._timeout_execution(tool_name, arguments)
+            return self._timeout_execution(tool_name, arguments, timeout_seconds=execution_timeout)
         if isinstance(result, TimeoutError):
-            return self._timeout_execution(tool_name, arguments)
+            return self._timeout_execution(tool_name, arguments, timeout_seconds=execution_timeout)
         if isinstance(result, BaseException):
             raise result
         return result
@@ -208,12 +222,14 @@ class AlphaChannelMCPClient:
         arguments: dict[str, Any],
         *,
         phase: str = "execution",
+        timeout_seconds: float | None = None,
     ) -> MCPToolExecution:
+        deadline = timeout_seconds or self._execution_timeout(tool_name)
         logger.error(
             "mcp_tool_call_timed_out tool=%s phase=%s timeout_seconds=%.1f",
             tool_name,
             phase,
-            self._tool_timeout_seconds,
+            deadline,
         )
         return MCPToolExecution(
             tool_name=tool_name,
@@ -224,7 +240,7 @@ class AlphaChannelMCPClient:
                     "phase": phase,
                     "message": (
                         f"{tool_name} did not complete within "
-                        f"{self._tool_timeout_seconds:.0f} seconds."
+                        f"{deadline:.0f} seconds."
                     ),
                 }
             ),
