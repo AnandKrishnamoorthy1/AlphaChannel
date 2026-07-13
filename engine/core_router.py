@@ -725,9 +725,9 @@ class AlphaChannelRouter:
         self.agent_brain = agent_brain or GeminiOrchestrationBrain(self.mcp_client)
         self._conversation_lock = threading.RLock()
         try:
-            configured_threshold = float(os.getenv("ALPHACHANNEL_INTENT_CONFIDENCE_THRESHOLD", "0.60"))
+            configured_threshold = float(os.getenv("ALPHACHANNEL_INTENT_CONFIDENCE_THRESHOLD", "0.70"))
         except (TypeError, ValueError):
-            configured_threshold = 0.60
+            configured_threshold = 0.70
             logger.warning("invalid_intent_confidence_threshold_using_default")
         self.intent_confidence_threshold = min(1.0, max(0.0, configured_threshold))
         self._conversations: dict[str, list[ConversationTurn]] = {}

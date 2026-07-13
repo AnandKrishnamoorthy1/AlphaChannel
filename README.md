@@ -20,6 +20,7 @@
 <p align="center"><em>Built for the Slack Agent Builder Challenge.</em></p>
 
 <p align="center">
+  <a href="#challenge-technologies">Challenge technologies</a> &middot;
   <a href="#the-problem">The problem</a> &middot;
   <a href="#see-it-in-action">See it in action</a> &middot;
   <a href="#why-it-is-an-agent">Why it is an agent</a> &middot;
@@ -29,6 +30,14 @@
 </p>
 
 ---
+
+## Challenge technologies
+
+AlphaChannel leverages all three qualifying technologies required by the Slack Agent Builder Challenge:
+
+- **Slack AI assistant capabilities:** provide stateful agent interaction, multi-turn thread continuity, live progress updates, and human approval checkpoints.
+- **Slack Real-Time Search API:** retrieves workspace-grounded messages, files, and conversation context to construct the Internal Workspace Perception evidence payload.
+- **Model Context Protocol server integrations:** let the Gemini orchestration brain autonomously invoke SEC EDGAR, Yahoo Finance, portfolio, repository, and governance tools through typed MCP contracts.
 
 ## The problem
 
@@ -50,7 +59,7 @@ AlphaChannel then:
 
 1. Retains the request as part of the Slack thread's conversation state.
 2. Lets Gemini select the evidence it needs from registered MCP tool schemas.
-3. Fetches live market structure from yFinance and the latest relevant filing from SEC EDGAR.
+3. Fetches live market fundamentals from Yahoo Finance MCP and the latest relevant filing from SEC EDGAR.
 4. Streams each research step into one updating Slack message without blocking Socket Mode.
 5. Cross-examines internal perception against external evidence and validates the result with Pydantic.
 6. Presents any trade or diagnostic action as an Approve, Deny, or Edit checkpoint.
@@ -61,6 +70,24 @@ The **Portfolio Center** provides the same interaction model across institutiona
 @AlphaChannel show my portfolio
 @AlphaChannel deep audit NU
 ```
+
+AlphaChannel can also resolve and verify a financial claim from the preceding Slack conversation:
+
+```text
+Analyst: Amazon revenue is amazing.
+Analyst: The company generated about $180 billion for Q1 2026.
+Analyst: @AlphaChannel fact check this
+```
+
+The Fact-Checking Engine retrieves the recent thread context, resolves Amazon to `AMZN`, extracts the revenue claim and reporting period, and compares it with evidence retrieved through Yahoo Finance MCP and SEC EDGAR before returning a sourced verification result in the same thread.
+
+For a consequential portfolio request, ask:
+
+```text
+@AlphaChannel Buy $500 of Amazon stock
+```
+
+AlphaChannel resolves Amazon to `AMZN`, gathers the reference market price, and pauses at an Approve, Deny, or Edit checkpoint. Approval updates the persistent paper portfolio and compliance audit trail; it does not submit an automatic live brokerage order.
 
 ## Why it is an agent
 
@@ -75,31 +102,7 @@ AlphaChannel is not a command-to-script switchboard. `GeminiOrchestrationBrain` 
 
 ## Architecture
 
-```text
- Open-ended Slack request
-            |
-            v
- Slack Bolt + Socket Mode ---- Slack Real-Time Search context
-            |
-            v
- GeminiOrchestrationBrain <-------------------------------+
-            |                                                |
-            v                                                |
- MCP tool selection                                          |
-       +----+-------------------+                            |
-       |                        |                            |
-       v                        v                            |
- Safe research tools      Consequential tools               |
- yFinance / SEC EDGAR     Diagnostics / trade gate           |
-       |                  Approve | Deny | Edit               |
-       +------------------------+-----------------------------+
-                                |
-                                v
- Perception-vs-reality synthesis + Pydantic validation
-                                |
-                                v
- Slack Block Kit scorecard + non-blocking progress updates
-```
+![AlphaChannel architecture showing Slack interaction, Gemini orchestration, governed MCP tools, policy controls, validation, and Block Kit responses](assets/Slack_Architecture.png)
 
 | Layer | Responsibility |
 | --- | --- |
