@@ -110,6 +110,12 @@ Any live integration must preserve the existing control contract:
 - Record the approval decision, broker response, order identifier, and resulting position delta in the compliance archive.
 - Support idempotency so repeated Slack clicks cannot create duplicate orders.
 
+## Google Cloud Deployment
+
+The Hackathon deployment runs as a persistent, single-instance service on a Google Cloud VM. The VM hosts `app.py`, the Gemini orchestration runtime, AlphaChannel's local MCP server, the Yahoo Finance MCP client process, isolated SEC retrieval processes, approval callbacks, and SQLite paper-portfolio state.
+
+Slack Socket Mode uses an outbound connection from the VM and does not require a public inbound Slack event endpoint. Secrets are supplied through the VM environment and remain outside source control. This topology intentionally favors a reliable single-instance demo path; production horizontal scaling would require shared conversation state, managed transactional portfolio storage, distributed action locking, and centralized secret management.
+
 ## Data and Security
 
 - Secrets load from `.env` and are never committed.

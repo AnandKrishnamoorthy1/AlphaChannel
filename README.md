@@ -5,7 +5,7 @@
 <h2 align="center">Catch the risk your deal room cannot see.</h2>
 
 <p align="center">
-  <strong>AlphaChannel</strong> turns Slack into a stateful institutional risk console. It contrasts internal conviction with live SEC EDGAR disclosures and Yahoo Finance MCP valuation and growth fundamentals, then routes consequential decisions through human approval.
+  <strong>AlphaChannel</strong> is a multi-agent AI harness that turns Slack into a stateful institutional risk console. It contrasts internal conviction with live SEC EDGAR disclosures and Yahoo Finance MCP valuation and growth fundamentals, then routes consequential decisions through human approval.
 </p>
 
 <p align="center">
@@ -13,6 +13,7 @@
   <img alt="Slack Bolt and Socket Mode" src="https://img.shields.io/badge/Slack-Bolt%20%2B%20Socket%20Mode-4A154B?logo=slack&logoColor=white" />
   <img alt="Gemini" src="https://img.shields.io/badge/AI-Gemini-4285F4" />
   <img alt="Model Context Protocol" src="https://img.shields.io/badge/MCP-FastMCP-159570" />
+  <img alt="Google Cloud VM" src="https://img.shields.io/badge/deployment-Google%20Cloud%20VM-4285F4?logo=googlecloud&logoColor=white" />
   <img alt="SEC EDGAR" src="https://img.shields.io/badge/data-SEC%20EDGAR-B31B1B" />
   <img alt="Human approval required" src="https://img.shields.io/badge/trades-human%20approval%20required-1F883D" />
 </p>
@@ -20,13 +21,10 @@
 <p align="center"><em>Built for the Slack Agent Builder Challenge.</em></p>
 
 <p align="center">
-  <a href="#challenge-technologies">Challenge technologies</a> &middot;
   <a href="#the-problem">The problem</a> &middot;
   <a href="#see-it-in-action">See it in action</a> &middot;
-  <a href="#why-it-is-an-agent">Why it is an agent</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
-  <a href="#quick-start">Quick start</a> &middot;
-  <a href="#security-and-governance">Security</a>
+  <a href="#deployment">Deployment</a>
 </p>
 
 ---
@@ -89,16 +87,16 @@ For a consequential portfolio request, ask:
 
 AlphaChannel resolves Amazon to `AMZN`, gathers the reference market price, and pauses at an Approve, Deny, or Edit checkpoint. Approval updates the persistent paper portfolio and compliance audit trail; it does not submit an automatic live brokerage order.
 
-## Why it is an agent
+## Agentic Architecture
 
-AlphaChannel is not a command-to-script switchboard. `GeminiOrchestrationBrain` is the central dispatcher.
+`GeminiOrchestrationBrain` is AlphaChannel's central reasoning and execution dispatcher. It interprets user goals, selects governed MCP tools, evaluates returned evidence, and continues reasoning until it can produce a validated response or must pause for human approval.
 
-- **Goal-oriented planning:** the model receives the user's goal, thread memory, workspace perception, and available MCP tool schemas.
-- **Autonomous tool choice:** read-only research tools can run without a hardcoded execution graph.
-- **Observation loop:** every tool result returns to the model, which decides whether to gather more evidence or synthesize an answer.
-- **Multi-turn continuity:** conversation and pending actions are keyed to the Slack channel and thread timestamp.
-- **Governed autonomy:** diagnostics and trade checkpoints pause the same reasoning continuation until a user approves, denies, or edits the parameters.
-- **Bounded execution:** the loop has a six-iteration cap, typed contracts, tool policy enforcement, and deterministic failure handling.
+- **Goal-oriented planning:** Gemini receives the user's goal, thread memory, workspace perception, and registered MCP tool schemas.
+- **Dynamic tool selection:** Gemini autonomously selects read-only research tools without relying on a fixed execution graph.
+- **Observation loop:** every tool result returns to Gemini, which decides whether to gather more evidence or synthesize the final response.
+- **Multi-turn continuity:** conversation state and pending actions are retained by Slack channel and thread timestamp.
+- **Governed autonomy:** consequential diagnostics and transaction actions pause for users to approve, deny, or edit their parameters.
+- **Bounded execution:** iteration limits, typed contracts, tool policies, timeouts, and deterministic fallbacks constrain the agent's behavior.
 
 ## Architecture
 
@@ -146,6 +144,12 @@ Users can connect a separately governed brokerage platform such as Robinhood, We
 
 The Portfolio Center stores account cash and equity positions in SQLite at `data/portfolio.db` by default. The file is ignored by Git and should live on a persistent application volume in a single-instance deployment. Each dashboard refresh attempts to replace stored reference prices with Yahoo Finance MCP prices and labels the source in Slack. For multi-instance or high-write production deployments, use a managed transactional repository instead of sharing a SQLite file across containers.
 
+## Deployment
+
+AlphaChannel is deployed on a Google Cloud VM as a persistent Slack Socket Mode service. The VM hosts the Slack Bolt application, Gemini orchestration runtime, governed MCP processes, direct SEC EDGAR retrieval, Yahoo Finance MCP client, approval callbacks, and SQLite paper-portfolio state.
+
+Socket Mode establishes an outbound connection to Slack, so AlphaChannel does not require a public inbound Slack webhook endpoint. Deployment credentials remain outside the repository and are loaded from the VM environment. The current SQLite and process-local conversation state are appropriate for this single-instance Hackathon deployment; a horizontally scaled production topology should use managed transactional storage and a shared conversation-state service.
+
 ## Quick start
 
 ### 1. Create the environment
@@ -168,9 +172,9 @@ SLACK_APP_TOKEN=xapp-your-socket-mode-token
 GEMINI_API_KEY=your-gemini-api-key
 GEMINI_MODEL=gemini-flash-latest
 
-# EdgarTools requires an identifiable organization and monitored contact address.
+# SEC fair-access policy requires an identifiable organization and monitored contact address.
 EDGAR_IDENTITY=AlphaChannel your-email@example.com
-SEC_EDGAR_BACKEND=edgartools
+SEC_EDGAR_BACKEND=raw
 
 LOG_LEVEL=INFO
 ALPHACHANNEL_RTS_LIMIT=12
@@ -198,7 +202,7 @@ The smoke test succeeds only when Gemini autonomously invokes `yfinance_fundamen
 
 - Slack action tokens remain ephemeral request parameters and are never treated as bearer credentials.
 - Secrets are read from `.env` or the deployment environment and excluded from structured logs.
-- SEC filings are retrieved through the maintained EdgarTools API, with declared identity, bounded request frequency, and official EDGAR endpoints. Set `SEC_EDGAR_BACKEND=raw` only for emergency compatibility testing.
+- SEC filings are retrieved from official EDGAR ticker, submissions, and filing archive endpoints with a declared identity, bounded request frequency, and isolated execution. EdgarTools remains an optional backend.
 - Gemini calls use configured model settings, timeouts, typed output validation, and clean fallbacks.
 - MCP policies distinguish autonomous read-only tools from consequential tools that require approval.
 - Trading controls are dry-run governance checkpoints; a separately governed broker integration is required for execution.
@@ -213,14 +217,18 @@ AlphaChannel/
 |-- mcp_servers.json
 |-- requirements.txt
 |-- .env.example
+|-- assets/
 |-- scripts/
 |   `-- golden_path_smoke_test.py
+|-- skills/
 `-- engine/
     |-- agent_brain.py
     |-- core_router.py
     |-- mcp_client.py
     |-- mcp_server.py
+    |-- portfolio_store.py
     |-- sec_node.py
+    |-- yahoo_finance_mcp_client.py
     |-- yfinance_node.py
     `-- trading_node.py
 ```
